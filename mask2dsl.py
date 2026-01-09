@@ -573,20 +573,12 @@ def consolidate_walls(walls: List[Wall], cfg):
             
             if num_near > 0: is_simple_joint = False
             
-            # Thickness Heuristics
-            mergable_thick = same_thick
-            if not mergable_thick and is_simple_joint:
-                is_curr_def = abs(current.thickness - 0.2) < 0.01
-                is_next_def = abs(next_w.thickness - 0.2) < 0.01
-                
-                if is_curr_def and not is_next_def and next_w.thickness > 0.2:
-                    current.thickness = next_w.thickness # Inherit real thickness
-                    mergable_thick = True
-                elif is_next_def and not is_curr_def and current.thickness > 0.2:
-                    mergable_thick = True # Keep current thickness
-
-            if gap < 0.2 and mergable_thick and is_simple_joint:
+            # Thickness policy:
+            # For collinear segments we merge whenever geometry/topology allows, and keep the thicker value.
+            # This treats thickness differences as sampling noise (or conservative "max thickness wins").
+            if gap < 0.2 and is_simple_joint:
                 # Merge
+                current.thickness = max(current.thickness, next_w.thickness)
                 if is_horiz: current.end = (next_w.end[0], current.end[1])
                 else: current.end = (current.end[0], next_w.end[1])
             else:
@@ -752,7 +744,10 @@ def main():
             p1 = (int(w.start[0]/cfg.meters_per_pixel), int(h - w.start[1]/cfg.meters_per_pixel))
             p2 = (int(w.end[0]/cfg.meters_per_pixel), int(h - w.end[1]/cfg.meters_per_pixel))
             cv2.line(orig, p1, p2, (0, 255, 0), 2)
-            cv2.putText(orig, w.id, p1, cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+            # Place label at 10% along the wall from the start point
+            lx = int(round(p1[0] + 0.1 * (p2[0] - p1[0])))
+            ly = int(round(p1[1] + 0.1 * (p2[1] - p1[1])))
+            cv2.putText(orig, w.id, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         cv2.imwrite(f"{args.debug_dir}/05_final_overlay.png", orig)
 
 if __name__ == "__main__":
