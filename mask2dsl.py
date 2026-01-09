@@ -639,6 +639,85 @@ def consolidate_walls(walls: List[Wall], cfg):
             cleaned_walls.append(w1)
     
     final_walls = cleaned_walls
+
+    def is_horizontal(w: Wall) -> bool:
+        dx = abs(w.start[0] - w.end[0])
+        dy = abs(w.start[1] - w.end[1])
+        return dx >= dy
+
+    def split_walls_at_t_junctions(walls_in: List[Wall]) -> List[Wall]:
+        """
+        Split a wall when an endpoint of a perpendicular wall lands on its interior.
+        This prevents long merged runs (e.g., a long top wall) from spanning across a T-junction.
+        """
+        tol = 0.2        # endpoint must be within 20cm of the wall centerline
+        end_margin = 0.2 # don't split within 20cm of the wall endpoints
+        min_seg_len = 0.05
+
+        result: List[Wall] = []
+        for w in walls_in:
+            horiz = is_horizontal(w)
+            if horiz:
+                y = w.start[1]
+                x0, x1 = sorted([w.start[0], w.end[0]])
+                split_xs = set()
+                for other in walls_in:
+                    if other is w or is_horizontal(other):
+                        continue
+                    for pt in (other.start, other.end):
+                        if abs(pt[1] - y) > tol:
+                            continue
+                        if pt[0] < x0 - tol or pt[0] > x1 + tol:
+                            continue
+                        if (x0 + end_margin) < pt[0] < (x1 - end_margin):
+                            split_xs.add(pt[0])
+                if not split_xs:
+                    result.append(w)
+                    continue
+                coords = [x0] + sorted(split_xs) + [x1]
+                for a, b in zip(coords, coords[1:]):
+                    if (b - a) < min_seg_len:
+                        continue
+                    result.append(Wall(
+                        id=w.id,
+                        start=(a, y),
+                        end=(b, y),
+                        thickness=w.thickness,
+                        height=w.height,
+                        px_geom=None,
+                    ))
+            else:
+                x = w.start[0]
+                y0, y1 = sorted([w.start[1], w.end[1]])
+                split_ys = set()
+                for other in walls_in:
+                    if other is w or not is_horizontal(other):
+                        continue
+                    for pt in (other.start, other.end):
+                        if abs(pt[0] - x) > tol:
+                            continue
+                        if pt[1] < y0 - tol or pt[1] > y1 + tol:
+                            continue
+                        if (y0 + end_margin) < pt[1] < (y1 - end_margin):
+                            split_ys.add(pt[1])
+                if not split_ys:
+                    result.append(w)
+                    continue
+                coords = [y0] + sorted(split_ys) + [y1]
+                for a, b in zip(coords, coords[1:]):
+                    if (b - a) < min_seg_len:
+                        continue
+                    result.append(Wall(
+                        id=w.id,
+                        start=(x, a),
+                        end=(x, b),
+                        thickness=w.thickness,
+                        height=w.height,
+                        px_geom=None,
+                    ))
+        return result
+
+    final_walls = split_walls_at_t_junctions(final_walls)
         
     for i, w in enumerate(final_walls): w.id = f"w_{i:03d}"
     return final_walls
