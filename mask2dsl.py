@@ -357,18 +357,62 @@ def consolidate_walls(walls: List[Wall], cfg):
         node_counts[get_key(w.start)] += 1
         node_counts[get_key(w.end)] += 1
             
-    horizontal = defaultdict(list)
-    vertical = defaultdict(list)
+    # Grouping Helper
+    def cluster_and_merge(walls_subset, is_horiz):
+        # 1. Cluster by primary axis (Y for horiz, X for vert)
+        # Tolerance: 0.15m (15cm) to catch slightly jagged walls
+        TOL = 0.15 
+        groups = [] # List of {'val': float, 'walls': []}
+        
+        idx = 1 if is_horiz else 0 # Primary axis index
+        
+        for w in walls_subset:
+            pos = (w.start[idx] + w.end[idx]) / 2
+            
+            best_g, min_diff = None, float('inf')
+            for g in groups:
+                diff = abs(g['val'] - pos)
+                if diff < TOL and diff < min_diff:
+                    min_diff = diff
+                    best_g = g
+            
+            if best_g:
+                best_g['walls'].append(w)
+                n = len(best_g['walls'])
+                best_g['val'] = (best_g['val'] * (n-1) + pos) / n
+            else:
+                groups.append({'val': pos, 'walls': [w]})
+        
+        # 2. Merge within groups
+        merged_results = []
+        for g in groups:
+            # Align them first! Force exact alignment to pivot for cleaner DSL
+            pivot = g['val']
+            for w in g['walls']:
+                if is_horiz: 
+                    w.start = (w.start[0], pivot)
+                    w.end = (w.end[0], pivot)
+                    if w.start[0] > w.end[0]: w.start, w.end = w.end, w.start
+                else: 
+                    w.start = (pivot, w.start[1])
+                    w.end = (pivot, w.end[1])
+                    if w.start[1] > w.end[1]: w.start, w.end = w.end, w.start
+            
+            merged_results.extend(merge_group(g['walls'], is_horiz))
+        return merged_results
+
+    h_input = []
+    v_input = []
     
     for w in walls:
         dx, dy = abs(w.start[0] - w.end[0]), abs(w.start[1] - w.end[1])
-        if dx > dy: horizontal[round(w.start[1], 2)].append(w)
-        else: vertical[round(w.start[0], 2)].append(w)
-            
+        if dx > dy: h_input.append(w)
+        else: v_input.append(w)
+        
     final_walls = []
     
     def merge_group(group, is_horiz):
-        idx = 0 if is_horiz else 1
+        idx = 0 if is_horiz else 1 # Sort/Gap axis
         group.sort(key=lambda w: w.start[idx])
         merged = []
         if not group: return []
@@ -378,11 +422,33 @@ def consolidate_walls(walls: List[Wall], cfg):
             gap = next_w.start[idx] - current.end[idx]
             same_thick = abs(current.thickness - next_w.thickness) < 0.05
             
-            # Check T-Junction
-            join_pt_key = get_key(current.end)
-            is_simple_joint = (node_counts[join_pt_key] == 2)
+            # Check T-Junction: Look for any OTHER wall near the join point
+            is_simple_joint = True
+            c_end = current.end
+            num_near = 0
+            join_pt = c_end
+            for check_w in walls:
+                if check_w is current or check_w is next_w: continue
+                d_s = math.hypot(check_w.start[0]-join_pt[0], check_w.start[1]-join_pt[1])
+                d_e = math.hypot(check_w.end[0]-join_pt[0], check_w.end[1]-join_pt[1])
+                if d_s < 0.2 or d_e < 0.2: 
+                    num_near += 1
             
-            if gap < 0.1 and same_thick and is_simple_joint:
+            if num_near > 0: is_simple_joint = False
+            
+            # Thickness Heuristics
+            mergable_thick = same_thick
+            if not mergable_thick and is_simple_joint:
+                is_curr_def = abs(current.thickness - 0.2) < 0.01
+                is_next_def = abs(next_w.thickness - 0.2) < 0.01
+                
+                if is_curr_def and not is_next_def and next_w.thickness > 0.2:
+                    current.thickness = next_w.thickness # Inherit real thickness
+                    mergable_thick = True
+                elif is_next_def and not is_curr_def and current.thickness > 0.2:
+                    mergable_thick = True # Keep current thickness
+
+            if gap < 0.2 and mergable_thick and is_simple_joint:
                 # Merge
                 if is_horiz: current.end = (next_w.end[0], current.end[1])
                 else: current.end = (current.end[0], next_w.end[1])
@@ -392,8 +458,8 @@ def consolidate_walls(walls: List[Wall], cfg):
         merged.append(current)
         return merged
 
-    for _, g in horizontal.items(): final_walls.extend(merge_group(g, True))
-    for _, g in vertical.items(): final_walls.extend(merge_group(g, False))
+    final_walls.extend(cluster_and_merge(h_input, True))
+    final_walls.extend(cluster_and_merge(v_input, False))
         
     for i, w in enumerate(final_walls): w.id = f"w_{i:03d}"
     return final_walls
