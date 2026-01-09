@@ -24,7 +24,7 @@ class Config:
     snap_tol_px: float = 10.0      # Distance to snap to major axes
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 25   # Prune skeletal dead ends
+    min_spur_length_px: int = 30   # Prune skeletal dead ends
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
 
@@ -165,13 +165,7 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
             pt2 = (int(v[0]), int(v[1]))
             cv2.line(pruned_img, pt1, pt2, 255, 1)
             
-        # Draw nodes (endpoints/junctions) in Red
-        debug_color = cv2.cvtColor(pruned_img, cv2.COLOR_GRAY2BGR)
-        for node in G.nodes():
-            if G.degree(node) != 2:
-                cv2.circle(debug_color, (int(node[0]), int(node[1])), 2, (0, 0, 255), -1)
-                
-        cv2.imwrite(f"{debug_dir}/01_skeleton_pruned.png", debug_color)
+        cv2.imwrite(f"{debug_dir}/01_skeleton_pruned.png", pruned_img)
         
     return G
 
@@ -349,6 +343,60 @@ def consolidate_walls(walls: List[Wall], cfg):
     """
     print("Phase 5.5: Topology-Aware Consolidation...")
     
+    # Pre-filter: Remove duplicate and heavily overlapping segments
+    filtered_walls = []
+    for i, w1 in enumerate(walls):
+        is_duplicate = False
+        for j, w2 in enumerate(walls):
+            if i >= j: continue  # Skip self and already compared pairs
+            
+            # Check if they're on the same line (collinear and overlapping)
+            dx1, dy1 = abs(w1.start[0] - w1.end[0]), abs(w1.start[1] - w1.end[1])
+            dx2, dy2 = abs(w2.start[0] - w2.end[0]), abs(w2.start[1] - w2.end[1])
+            
+            is_w1_vert = dy1 > dx1
+            is_w2_vert = dy2 > dx2
+            
+            if is_w1_vert != is_w2_vert: continue  # Different orientations
+            
+            # Check if on same axis (within tolerance)
+            if is_w1_vert:
+                axis_diff = abs(w1.start[0] - w2.start[0])
+                if axis_diff > 0.15: continue
+                
+                # Check overlap on Y axis
+                w1_min_y, w1_max_y = min(w1.start[1], w1.end[1]), max(w1.start[1], w1.end[1])
+                w2_min_y, w2_max_y = min(w2.start[1], w2.end[1]), max(w2.start[1], w2.end[1])
+                
+                overlap = min(w1_max_y, w2_max_y) - max(w1_min_y, w2_min_y)
+                w1_len = w1_max_y - w1_min_y
+                
+                # If w1 is >80% contained in w2, mark as duplicate
+                if overlap > 0 and overlap / w1_len > 0.8:
+                    is_duplicate = True
+                    break
+            else:  # Horizontal
+                axis_diff = abs(w1.start[1] - w2.start[1])
+                if axis_diff > 0.15: continue
+                
+                # Check overlap on X axis
+                w1_min_x, w1_max_x = min(w1.start[0], w1.end[0]), max(w1.start[0], w1.end[0])
+                w2_min_x, w2_max_x = min(w2.start[0], w2.end[0]), max(w2.start[0], w2.end[0])
+                
+                overlap = min(w1_max_x, w2_max_x) - max(w1_min_x, w2_min_x)
+                w1_len = w1_max_x - w1_min_x
+                
+                # If w1 is >80% contained in w2, mark as duplicate
+                if overlap > 0 and overlap / w1_len > 0.8:
+                    is_duplicate = True
+                    break
+        
+        if not is_duplicate:
+            filtered_walls.append(w1)
+    
+    print(f"  Filtered {len(walls) - len(filtered_walls)} duplicate/overlapping segments")
+    walls = filtered_walls
+    
     # Map node degrees
     node_counts = defaultdict(int)
     def get_key(pt): return (round(pt[0], 3), round(pt[1], 3))
@@ -403,7 +451,7 @@ def consolidate_walls(walls: List[Wall], cfg):
 
     h_input = []
     v_input = []
-    
+
     for w in walls:
         dx, dy = abs(w.start[0] - w.end[0]), abs(w.start[1] - w.end[1])
         if dx > dy: h_input.append(w)
@@ -413,22 +461,93 @@ def consolidate_walls(walls: List[Wall], cfg):
     
     def merge_group(group, is_horiz):
         idx = 0 if is_horiz else 1 # Sort/Gap axis
+        
+        # Pre-filter redundant walls WITHIN this group
+        # Since they are all snapped to same pivot, we only need to check the 'range' axis (idx)
+        cleaned_group = []
+        for i, w1 in enumerate(group):
+            is_redundant = False
+            w1_min = min(w1.start[idx], w1.end[idx])
+            w1_max = max(w1.start[idx], w1.end[idx])
+            w1_len = w1_max - w1_min
+            
+            for j, w2 in enumerate(group):
+                if i == j: continue
+                w2_min = min(w2.start[idx], w2.end[idx])
+                w2_max = max(w2.start[idx], w2.end[idx])
+                w2_len = w2_max - w2_min
+                
+                # If w1 is contained in w2 (and w1 is smaller or equal length)
+                # If equal length, use index to break tie (only remove one)
+                if w1_len > w2_len: continue
+                if abs(w1_len - w2_len) < 0.001 and i < j: continue # Tie breaker
+                
+                if w1_min >= w2_min - 0.01 and w1_max <= w2_max + 0.01:
+                    is_redundant = True
+                    break
+            
+            if not is_redundant:
+                cleaned_group.append(w1)
+        
+        group = cleaned_group
+        
+        # Debug: Print cleaned group size
+        if len(group) > 0 and abs(group[0].start[is_horiz and 1 or 0] - 2.419) < 0.05:
+            print(f"DEBUG MERGE_GROUP x=2.419. Count: {len(group)}")
+            for w in group:
+                print(f"  W: {w.start[idx]:.3f} -> {w.end[idx]:.3f}, t={w.thickness:.2f}")
+
         group.sort(key=lambda w: w.start[idx])
         merged = []
         if not group: return []
         
         current = group[0]
         for next_w in group[1:]:
-            gap = next_w.start[idx] - current.end[idx]
+            # Gap check
+            c_end_val = current.end[idx]
+            n_start_val = next_w.start[idx]
+            gap = n_start_val - c_end_val
+            
+            # Simple 'touching' logic
+            # Also check if they are "mergable" (similar thickness)
+            
+            # 1. Thickness match?
+            # Allow merging if thickness is very close
             same_thick = abs(current.thickness - next_w.thickness) < 0.05
             
             # Check T-Junction: Look for any OTHER wall near the join point
+            # Ignore very short walls (<0.5m) as they are likely artifacts
+            # Ignore collinear walls on the same axis (they're part of the same wall we're consolidating!)
             is_simple_joint = True
             c_end = current.end
             num_near = 0
             join_pt = c_end
+            
+            # Determine current wall's orientation
+            curr_dx = abs(current.end[0] - current.start[0])
+            curr_dy = abs(current.end[1] - current.start[1])
+            curr_is_vert = curr_dy > curr_dx
+            
             for check_w in walls:
                 if check_w is current or check_w is next_w: continue
+                
+                # Calculate wall length and skip short artifacts
+                check_len = math.hypot(check_w.end[0]-check_w.start[0], check_w.end[1]-check_w.start[1])
+                if check_len < 0.5: continue  # Skip short artifact walls
+                
+                
+                # Ignore collinear walls on the same axis (they're part of the same wall chain!)
+                dx2, dy2 = check_w.end[0]-check_w.start[0], check_w.end[1]-check_w.start[1]
+                
+                # Determine orientation
+                is_w2_vert = abs(dy2) > abs(dx2)
+                
+                if curr_is_vert == is_w2_vert:
+                    if curr_is_vert:
+                        if abs(current.start[0] - check_w.start[0]) < 0.1: continue
+                    else:
+                        if abs(current.start[1] - check_w.start[1]) < 0.1: continue
+
                 d_s = math.hypot(check_w.start[0]-join_pt[0], check_w.start[1]-join_pt[1])
                 d_e = math.hypot(check_w.end[0]-join_pt[0], check_w.end[1]-join_pt[1])
                 if d_s < 0.2 or d_e < 0.2: 
@@ -453,13 +572,63 @@ def consolidate_walls(walls: List[Wall], cfg):
                 if is_horiz: current.end = (next_w.end[0], current.end[1])
                 else: current.end = (current.end[0], next_w.end[1])
             else:
-                merged.append(current)
-                current = next_w
+                 merged.append(current)
+                 current = next_w
         merged.append(current)
         return merged
 
     final_walls.extend(cluster_and_merge(h_input, True))
     final_walls.extend(cluster_and_merge(v_input, False))
+    
+    # Post-consolidation: Remove short walls that are entirely contained in longer walls
+    cleaned_walls = []
+    for i, w1 in enumerate(final_walls):
+        w1_len = math.hypot(w1.end[0]-w1.start[0], w1.end[1]-w1.start[1])
+        
+        is_redundant = False
+        for j, w2 in enumerate(final_walls):
+            if i == j: continue
+            
+            w2_len = math.hypot(w2.end[0]-w2.start[0], w2.end[1]-w2.start[1])
+            
+            # Only check if w1 is shorter than w2
+            if w1_len >= w2_len: continue
+            
+            # Check if they're collinear
+            dx1, dy1 = abs(w1.end[0] - w1.start[0]), abs(w1.end[1] - w1.start[1])
+            dx2, dy2 = abs(w2.end[0] - w2.start[0]), abs(w2.end[1] - w2.start[1])
+            
+            is_w1_vert = dy1 > dx1
+            is_w2_vert = dy2 > dx2
+            
+            if is_w1_vert != is_w2_vert: continue
+            
+            # Check if on same axis
+            if is_w1_vert:
+                if abs(w1.start[0] - w2.start[0]) > 0.05: continue
+                
+                # Check if w1 is contained in w2
+                w1_min_y, w1_max_y = min(w1.start[1], w1.end[1]), max(w1.start[1], w1.end[1])
+                w2_min_y, w2_max_y = min(w2.start[1], w2.end[1]), max(w2.start[1], w2.end[1])
+                
+                if w1_min_y >= w2_min_y and w1_max_y <= w2_max_y:
+                    is_redundant = True
+                    break
+            else:  # Horizontal
+                if abs(w1.start[1] - w2.start[1]) > 0.05: continue
+                
+                # Check if w1 is contained in w2
+                w1_min_x, w1_max_x = min(w1.start[0], w1.end[0]), max(w1.start[0], w1.end[0])
+                w2_min_x, w2_max_x = min(w2.start[0], w2.end[0]), max(w2.start[0], w2.end[0])
+                
+                if w1_min_x >= w2_min_x and w1_max_x <= w2_max_x:
+                    is_redundant = True
+                    break
+        
+        if not is_redundant:
+            cleaned_walls.append(w1)
+    
+    final_walls = cleaned_walls
         
     for i, w in enumerate(final_walls): w.id = f"w_{i:03d}"
     return final_walls
