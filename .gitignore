@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# OS
+.DS_Store
+
+# Project outputs and debug files
+result.dsl
+debug/
+debug_test/
