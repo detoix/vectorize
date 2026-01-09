@@ -132,28 +132,46 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
                     G.add_edge((x, y), nx_pt, weight=dist)
 
     # Prune Spurs
+    # Walk outward from every degree-1 node until we hit a junction (deg>=3) or the path gets long enough.
+    # Using a `prev` pointer is critical here; relying on neighbor ordering makes pruning nondeterministic.
     while True:
-        pruned = False
+        pruned_any = False
         deg1_nodes = [n for n in G.nodes() if G.degree(n) == 1]
-        for n in deg1_nodes:
-            path = [n]
-            curr = n
-            length = 0
-            while G.degree(curr) <= 2:
-                neighbors = list(G.neighbors(curr))
-                if not neighbors: break
-                next_node = neighbors[0] if neighbors[0] != path[-1] else (neighbors[1] if len(neighbors) > 1 else neighbors[0])
-                if next_node in path: break
-                length += G[curr][next_node]['weight']
-                path.append(next_node)
-                curr = next_node
-                if G.degree(curr) > 2 or length > cfg.min_spur_length_px: break
-            
-            if G.degree(curr) > 2 and length < cfg.min_spur_length_px:
+        for start in deg1_nodes:
+            if not G.has_node(start) or G.degree(start) != 1:
+                continue
+
+            path = [start]
+            length = 0.0
+            prev = None
+            curr = start
+
+            while True:
+                nbrs = list(G.neighbors(curr))
+                next_candidates = [n for n in nbrs if n != prev]
+                if not next_candidates:
+                    break
+
+                nxt = next_candidates[0]
+                length += float(G[curr][nxt].get("weight", 1.0))
+                path.append(nxt)
+                prev, curr = curr, nxt
+
+                if G.degree(curr) != 2 or length >= cfg.min_spur_length_px:
+                    break
+
+            if length >= cfg.min_spur_length_px:
+                continue
+
+            # Only remove true spurs: a short degree-1 chain that attaches into a junction.
+            if G.has_node(curr) and G.degree(curr) >= 3:
                 for p in path[:-1]:
-                    if G.has_node(p): G.remove_node(p)
-                pruned = True
-        if not pruned: break
+                    if G.has_node(p):
+                        G.remove_node(p)
+                        pruned_any = True
+
+        if not pruned_any:
+            break
 
     if debug_dir:
         # Create a blank black image
