@@ -27,6 +27,16 @@ class Config:
     min_spur_length_px: int = 15   # Prune skeletal dead ends
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
+    opening_search_dilate_px: int = 15
+    corner_gap_deviation_deg: float = 30.0
+
+    long_opening_m: float = 1.9
+    door_circularity_thresh: float = 0.25
+    door_swing_perp_factor: float = 1.5
+    door_swing_perp_min_px: float = 8.0
+    default_door_height_m: float = 2.1
+    default_window_height_m: float = 1.2
+    default_window_sill_m: float = 0.9
 
 # --- DATA STRUCTURES ---
 @dataclass
@@ -47,9 +57,65 @@ class Opening:
     width: float
     height: float = 2.1
     sill: float = 0.0
+    px_center: Optional[Tuple[int, int]] = None
 
 # --- PHASE 0: IO & MASKS ---
-def create_robust_union_mask(mask_wall, mask_open, debug_dir):
+def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
+    """
+    Returns key information about the two biggest nearby wall components (jambs) around an opening contour.
+    Used both for robust bridging and later for opening classification (avoid duplicated logic).
+    """
+    single_mask = np.zeros_like(mask_wall)
+    cv2.drawContours(single_mask, [cnt], -1, 255, -1)
+    search_zone = cv2.dilate(
+        single_mask,
+        np.ones((cfg.opening_search_dilate_px, cfg.opening_search_dilate_px), np.uint8),
+    )
+    nearby_walls = cv2.bitwise_and(mask_wall, search_zone)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(nearby_walls)
+    if num_labels < 3:
+        return None
+
+    sorted_indices = np.argsort(stats[1:, 4])[::-1] + 1
+    jamb_a_idx = sorted_indices[0]
+    jamb_b_idx = sorted_indices[1]
+
+    pt_a = (int(centroids[jamb_a_idx][0]), int(centroids[jamb_a_idx][1]))
+    pt_b = (int(centroids[jamb_b_idx][0]), int(centroids[jamb_b_idx][1]))
+
+    M = cv2.moments(cnt)
+    if M["m00"] != 0:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        center_opening = (cx, cy)
+    else:
+        center_opening = (int(np.mean(cnt[:, 0, 0])), int(np.mean(cnt[:, 0, 1])))
+
+    return {
+        "labels": labels,
+        "jamb_a_idx": jamb_a_idx,
+        "jamb_b_idx": jamb_b_idx,
+        "pt_a": pt_a,
+        "pt_b": pt_b,
+        "center_opening": center_opening,
+    }
+
+
+def min_axis_deviation_deg(pt_a: Tuple[float, float], pt_b: Tuple[float, float]) -> float:
+    dx = pt_b[0] - pt_a[0]
+    dy = pt_b[1] - pt_a[1]
+    angle_deg = math.degrees(math.atan2(dy, dx)) % 360
+
+    dist_to_0 = min(abs(angle_deg - 0), abs(angle_deg - 360))
+    dist_to_90 = abs(angle_deg - 90)
+    dist_to_180 = abs(angle_deg - 180)
+    dist_to_270 = abs(angle_deg - 270)
+
+    return min(dist_to_0, dist_to_90, dist_to_180, dist_to_270)
+
+
+def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
     """
     Bridges wall gaps ONLY where a blue opening exists.
     """
@@ -60,117 +126,92 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir):
     
     for i, cnt in enumerate(contours):
         if cv2.contourArea(cnt) < 10: continue
-        
-        single_door_mask = np.zeros_like(mask_wall)
-        cv2.drawContours(single_door_mask, [cnt], -1, 255, -1)
-        search_zone = cv2.dilate(single_door_mask, np.ones((15,15), np.uint8))
-        nearby_walls = cv2.bitwise_and(mask_wall, search_zone)
-        
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(nearby_walls)
-        
-        if num_labels >= 3:
-            sorted_indices = np.argsort(stats[1:, 4])[::-1] + 1 
-            jamb_a_idx = sorted_indices[0]
-            jamb_b_idx = sorted_indices[1]
-            
-            pt_a = (int(centroids[jamb_a_idx][0]), int(centroids[jamb_a_idx][1]))
-            pt_b = (int(centroids[jamb_b_idx][0]), int(centroids[jamb_b_idx][1]))
 
-            # Calculate Opening Centroid
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                center_opening = (cx, cy)
-            else:
-                center_opening = (int(np.mean(cnt[:,0,0])), int(np.mean(cnt[:,0,1])))
-            
-            is_corner = False
-            intersection = None
-            
-            # Check for Skew Gap (Diagonal) via ANGLE
-            dx = pt_b[0] - pt_a[0]
-            dy = pt_b[1] - pt_a[1]
-            
-            angle_deg = math.degrees(math.atan2(dy, dx)) % 360
-            
-            # Deviation from nearest 90-degree axis
-            # 0, 90, 180, 270, 360
-            dist_to_0 = min(abs(angle_deg - 0), abs(angle_deg - 360))
-            dist_to_90 = abs(angle_deg - 90)
-            dist_to_180 = abs(angle_deg - 180)
-            dist_to_270 = abs(angle_deg - 270)
-            
-            min_deviation = min(dist_to_0, dist_to_90, dist_to_180, dist_to_270)
-            
-            # If the angle is more than 20 degrees off-axis, it's a diagonal (corner) gap
-            is_skew_gap = min_deviation > 30
+        ctx = get_opening_jamb_context(cnt, mask_wall, cfg)
+        if ctx is None:
+            continue
 
-            if is_skew_gap:
-                # Candidates
-                candidates = []
-                
-                # 1. Axis-Aligned Candidates
-                cand1 = (pt_a[0], pt_b[1])
-                cand2 = (pt_b[0], pt_a[1])
-                candidates.append(cand1)
-                candidates.append(cand2)
+        labels = ctx["labels"]
+        jamb_a_idx = ctx["jamb_a_idx"]
+        jamb_b_idx = ctx["jamb_b_idx"]
+        pt_a = ctx["pt_a"]
+        pt_b = ctx["pt_b"]
+        center_opening = ctx["center_opening"]
 
-                # 2. FitLine Candidate
-                mask_a = (labels == jamb_a_idx).astype(np.uint8)
-                mask_b = (labels == jamb_b_idx).astype(np.uint8)
-                pts_a = cv2.findNonZero(mask_a)
-                pts_b = cv2.findNonZero(mask_b)
-                
-                if pts_a is not None and len(pts_a) > 5 and pts_b is not None and len(pts_b) > 5:
-                     [vx_a, vy_a, x_a, y_a] = cv2.fitLine(pts_a, cv2.DIST_L2, 0, 0.01, 0.01)
-                     [vx_b, vy_b, x_b, y_b] = cv2.fitLine(pts_b, cv2.DIST_L2, 0, 0.01, 0.01)
-                     
-                     det = -vx_a[0]*vy_b[0] + vy_a[0]*vx_b[0]
-                     if abs(det) > 0.1:
-                         dx = x_b[0] - x_a[0]
-                         dy = y_b[0] - y_a[0]
-                         t = (dx * (-vy_b[0]) - (-vx_b[0]) * dy) / det
-                         ix = x_a[0] + t * vx_a[0]
-                         iy = y_a[0] + t * vy_a[0]
-                         candidates.append((int(ix), int(iy)))
+        is_corner = False
+        intersection = None
 
-                # Select Best Candidate based on proximity to opening center
-                best_cand = None
-                min_dist = float('inf')
+        # If the angle is more than the threshold off-axis, it's a diagonal (corner) gap.
+        is_skew_gap = min_axis_deviation_deg(pt_a, pt_b) > cfg.corner_gap_deviation_deg
+
+        if is_skew_gap:
+            # Candidates
+            candidates = []
+            
+            # 1. Axis-Aligned Candidates
+            cand1 = (pt_a[0], pt_b[1])
+            cand2 = (pt_b[0], pt_a[1])
+            candidates.append(cand1)
+            candidates.append(cand2)
+
+            # 2. FitLine Candidate
+            mask_a = (labels == jamb_a_idx).astype(np.uint8)
+            mask_b = (labels == jamb_b_idx).astype(np.uint8)
+            pts_a = cv2.findNonZero(mask_a)
+            pts_b = cv2.findNonZero(mask_b)
+            
+            if pts_a is not None and len(pts_a) > 5 and pts_b is not None and len(pts_b) > 5:
+                [vx_a, vy_a, x_a, y_a] = cv2.fitLine(pts_a, cv2.DIST_L2, 0, 0.01, 0.01)
+                [vx_b, vy_b, x_b, y_b] = cv2.fitLine(pts_b, cv2.DIST_L2, 0, 0.01, 0.01)
                 
-                for c in candidates:
-                    d = math.hypot(c[0]-center_opening[0], c[1]-center_opening[1])
-                    # Sanity: Candidate shouldn't be wildly far from both wall ends
-                    dist_to_a = math.hypot(c[0]-pt_a[0], c[1]-pt_a[1])
-                    dist_to_b = math.hypot(c[0]-pt_b[0], c[1]-pt_b[1])
-                    dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
-                    
-                    if dist_to_a < dist_ab * 2.5 and dist_to_b < dist_ab * 2.5:
-                        if d < min_dist:
-                            min_dist = d
-                            best_cand = c
-                
-                # Threshold
+                det = -vx_a[0]*vy_b[0] + vy_a[0]*vx_b[0]
+                if abs(det) > 0.1:
+                    dx = x_b[0] - x_a[0]
+                    dy = y_b[0] - y_a[0]
+                    t = (dx * (-vy_b[0]) - (-vx_b[0]) * dy) / det
+                    ix = x_a[0] + t * vx_a[0]
+                    iy = y_a[0] + t * vy_a[0]
+                    candidates.append((int(ix), int(iy)))
+
+            # Select Best Candidate based on proximity to opening center
+            best_cand = None
+            min_dist = float('inf')
+            
+            for c in candidates:
+                d = math.hypot(c[0]-center_opening[0], c[1]-center_opening[1])
+                # Sanity: Candidate shouldn't be wildly far from both wall ends
+                dist_to_a = math.hypot(c[0]-pt_a[0], c[1]-pt_a[1])
+                dist_to_b = math.hypot(c[0]-pt_b[0], c[1]-pt_b[1])
                 dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
-                if best_cand and min_dist < dist_ab:
-                     is_corner = True
-                     intersection = best_cand
+                
+                if dist_to_a < dist_ab * 2.5 and dist_to_b < dist_ab * 2.5:
+                    if d < min_dist:
+                        min_dist = d
+                        best_cand = c
+            
+            # Threshold
+            dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
+            if best_cand and min_dist < dist_ab:
+                is_corner = True
+                intersection = best_cand
 
-            if is_corner and intersection:
-                cv2.line(union_mask, pt_a, intersection, 255, thickness=4)
-                cv2.line(union_mask, intersection, pt_b, 255, thickness=4)
-                cv2.line(debug_img, pt_a, intersection, (0, 255, 0), 2)
-                cv2.line(debug_img, intersection, pt_b, (0, 255, 0), 2)
-                cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1) # Mark the corner
-            else:
-                cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
-                cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
+        if is_corner and intersection:
+            cv2.line(union_mask, pt_a, intersection, 255, thickness=4)
+            cv2.line(union_mask, intersection, pt_b, 255, thickness=4)
+
+            cv2.line(debug_img, pt_a, intersection, (0, 255, 0), 2)
+            cv2.line(debug_img, intersection, pt_b, (0, 255, 0), 2)
+            cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1) # Mark the corner
+
+            cv2.line(mask_open, [intersection[0] + 15, intersection[1]+15], [intersection[0] - 15, intersection[1]-15], (0, 110, 100), 2) # draw a skew line that will split single opening mask in two
+        else:
+            cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
+            cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
             
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/00_robust_bridges.png", debug_img)
         
-    return union_mask
+    return [union_mask, mask_open]
 
 def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     print(f"Phase 0: Loading {path}...")
@@ -184,17 +225,17 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.opening_bridge_px, cfg.opening_bridge_px))
     mask_open_dilated = cv2.dilate(mask_open, kernel, iterations=1)
     
-    mask_union = create_robust_union_mask(mask_wall, mask_open_dilated, debug_dir)
+    [mask_union, mask_open] = create_robust_union_mask(mask_wall, mask_open_dilated, debug_dir, cfg)
     mask_union = cv2.morphologyEx(mask_union, cv2.MORPH_CLOSE, kernel)
 
     # Compute Distance Transform on SOLID WALLS only (not the bridge)
     dist_map = cv2.distanceTransform(mask_wall, cv2.DIST_L2, 5)
 
     if debug_dir:
-        cv2.imwrite(f"{debug_dir}/00_union_mask.png", mask_union)
+        cv2.imwrite(f"{debug_dir}/00_union_mask.png", mask_open)
         cv2.imwrite(f"{debug_dir}/00_dist_map.png", (dist_map/dist_map.max()*255).astype(np.uint8))
 
-    return mask_union, mask_open, dist_map, img_rgb.shape[:2]
+    return mask_union, mask_wall, mask_open, dist_map, img_rgb.shape[:2]
 
 # --- PHASE 1: SKELETON ---
 def build_skeleton_graph(mask_union, debug_dir, cfg):
@@ -833,7 +874,7 @@ def consolidate_walls(walls: List[Wall], cfg):
     return final_walls
 
 # --- PHASE 6: OPENINGS ---
-def extract_openings(mask_open, walls: List[Wall], cfg):
+def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
     print("Phase 6: Projecting Openings...")
     contours, _ = cv2.findContours(mask_open, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     openings = []
@@ -869,7 +910,59 @@ def extract_openings(mask_open, walls: List[Wall], cfg):
         if min_dist > 0.5: continue 
         
         rect = cv2.minAreaRect(cnt)
-        width_m = max(rect[1]) * cfg.meters_per_pixel
+        rect_w_px, rect_h_px = rect[1]
+        long_px = float(max(rect_w_px, rect_h_px))
+        short_px = float(min(rect_w_px, rect_h_px))
+        width_m = long_px * cfg.meters_per_pixel
+
+        # Door-vs-window heuristics (plan view):
+        # - If pixels extend far away (perpendicular) from the wall axis => door (door swing)
+        # - Long openings => door (terrace/sliding doors)
+
+        h_px = mask_open.shape[0]
+        p1 = np.array(
+            [
+                best_wall.start[0] / cfg.meters_per_pixel,
+                h_px - best_wall.start[1] / cfg.meters_per_pixel,
+            ],
+            dtype=np.float32,
+        )
+        p2 = np.array(
+            [
+                best_wall.end[0] / cfg.meters_per_pixel,
+                h_px - best_wall.end[1] / cfg.meters_per_pixel,
+            ],
+            dtype=np.float32,
+        )
+        v = p2 - p1
+        v_norm = float(np.hypot(v[0], v[1]))
+        pts = cnt[:, 0, :].astype(np.float32)
+        if v_norm > 1e-6 and len(pts) > 0:
+            # Perpendicular distance from point to line (p1->p2) in pixel units.
+            cross = v[0] * (pts[:, 1] - p1[1]) - v[1] * (pts[:, 0] - p1[0])
+            perp_dist_px = np.abs(cross) / v_norm
+            max_perp_px = float(np.max(perp_dist_px))
+        else:
+            max_perp_px = 0.0
+
+        wall_thickness_m = best_wall.thickness if best_wall.thickness > 0 else cfg.default_thickness
+        wall_thickness_px = wall_thickness_m / cfg.meters_per_pixel
+        swing_thresh_px = max(cfg.door_swing_perp_min_px, cfg.door_swing_perp_factor * wall_thickness_px)
+        door_by_swing = max_perp_px >= swing_thresh_px
+
+        if door_by_swing:
+            opening_type = "door"
+        elif width_m >= cfg.long_opening_m:
+            opening_type = "door"
+        else:
+            opening_type = "window"
+
+        if opening_type == "window":
+            height_m = cfg.default_window_height_m
+            sill_m = cfg.default_window_sill_m
+        else:
+            height_m = cfg.default_door_height_m
+            sill_m = 0.0
 
         # Project centroid to wall axis, then convert to "edge closest to wall.start".
         w_line = LineString([best_wall.start, best_wall.end])
@@ -886,8 +979,14 @@ def extract_openings(mask_open, walls: List[Wall], cfg):
             at_m = 0.0
         
         openings.append(Opening(
-            id=f"o_{i:03d}", type="door",
-            wall_id=best_wall.id, at=round(at_m, 3), width=round(width_m, 3)
+            id=f"o_{i:03d}",
+            type=opening_type,
+            wall_id=best_wall.id,
+            at=round(at_m, 3),
+            width=round(width_m, 3),
+            height=height_m,
+            sill=sill_m,
+            px_center=(int(round(cx)), int(round(cy))),
         ))
     return openings
 
@@ -902,8 +1001,16 @@ def emit_dsl(walls: List[Wall], openings: List[Opening]):
         
     openings.sort(key=lambda x: (x.wall_id, x.at))
     for o in openings:
-        lines.append(f'{o.type}("{o.id}").in("{o.wall_id}").at({o.at:.3f})'
-                     f'.w({o.width:.3f}).h({o.height})')
+        if o.type == "window":
+            lines.append(
+                f'{o.type}("{o.id}").in("{o.wall_id}").at({o.at:.3f})'
+                f'.w({o.width:.3f}).h({o.height}).sill({o.sill})'
+            )
+        else:
+            lines.append(
+                f'{o.type}("{o.id}").in("{o.wall_id}").at({o.at:.3f})'
+                f'.w({o.width:.3f}).h({o.height})'
+            )
     return "\n".join(lines)
 
 # --- MAIN ---
@@ -923,7 +1030,7 @@ def main():
     cfg = Config(meters_per_pixel=args.scale)
     if args.debug_dir: os.makedirs(args.debug_dir, exist_ok=True)
         
-    mask_union, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
+    mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
     skel_graph = build_skeleton_graph(mask_union, args.debug_dir, cfg)
     raw_vectors = graph_to_vectors(skel_graph, args.debug_dir, cfg)
     snapped_walls = gravity_snap(raw_vectors, args.debug_dir, cfg)
@@ -934,7 +1041,7 @@ def main():
     # 2. Consolidation (Merge + Junction Check)
     walls_merged = consolidate_walls(walls_raw, cfg)
     # 3. Openings (Map to merged)
-    openings = extract_openings(mask_open, walls_merged, cfg)
+    openings = extract_openings(mask_open, mask_wall, walls_merged, cfg)
     
     with open(args.out, "w") as f:
         f.write(emit_dsl(walls_merged, openings))
@@ -944,13 +1051,20 @@ def main():
         orig = cv2.imread(args.input)
         h, w_img = dims
         for w in walls_merged:
-            p1 = (int(w.start[0]/cfg.meters_per_pixel), int(h - w.start[1]/cfg.meters_per_pixel))
-            p2 = (int(w.end[0]/cfg.meters_per_pixel), int(h - w.end[1]/cfg.meters_per_pixel))
+            p1 = (int(w.start[0] / cfg.meters_per_pixel), int(h - w.start[1] / cfg.meters_per_pixel))
+            p2 = (int(w.end[0] / cfg.meters_per_pixel), int(h - w.end[1] / cfg.meters_per_pixel))
             cv2.line(orig, p1, p2, (0, 255, 0), 2)
             # Place label at 10% along the wall from the start point
-            lx = int(round(p1[0] + 0.1 * (p2[0] - p1[0])))
-            ly = int(round(p1[1] + 0.1 * (p2[1] - p1[1])))
+            lx = int(round(p1[0] + 0.2 * (p2[0] - p1[0])))
+            ly = int(round(p1[1] + 0.2 * (p2[1] - p1[1])))
             cv2.putText(orig, w.id, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        for o in openings:
+            if o.px_center is None:
+                continue
+            cx, cy = o.px_center
+            color = (255, 255, 0) if o.type == "window" else (0, 255, 255)
+            cv2.circle(orig, (cx, cy), 3, color, -1)
         cv2.imwrite(f"{args.debug_dir}/05_final_overlay.png", orig)
 
 if __name__ == "__main__":
