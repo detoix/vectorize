@@ -24,7 +24,7 @@ class Config:
     snap_tol_px: float = 10.0      # Distance to snap to major axes
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 10   # Prune skeletal dead ends
+    min_spur_length_px: int = 15   # Prune skeletal dead ends
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
 
@@ -219,6 +219,23 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
                     dist = math.sqrt(dx*dx + dy*dy)
                     G.add_edge((x, y), nx_pt, weight=dist)
 
+    def spur_alignment_score(path: List[Tuple[int, int]]) -> float:
+        """
+        Returns ~1.0 for axis-aligned (H/V) spurs, ~0.707 for diagonals.
+
+        Uses only the start and end of the spur (net direction), not per-step directions.
+        """
+        if len(path) < 2:
+            return 1.0
+        dx = float(path[-1][0] - path[0][0])
+        dy = float(path[-1][1] - path[0][1])
+        norm = math.hypot(dx, dy)
+        if norm <= 1e-9:
+            return 1.0
+        ux = abs(dx) / norm
+        uy = abs(dy) / norm
+        return max(ux, uy)
+
     # Prune Spurs
     # Walk outward from every degree-1 node until we hit a junction (deg>=3) or the path gets long enough.
     # Using a `prev` pointer is critical here; relying on neighbor ordering makes pruning nondeterministic.
@@ -233,6 +250,8 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
             length = 0.0
             prev = None
             curr = start
+            alignment = 1.0
+            effective_length = 0.0
 
             while True:
                 nbrs = list(G.neighbors(curr))
@@ -245,10 +264,13 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
                 path.append(nxt)
                 prev, curr = curr, nxt
 
-                if G.degree(curr) != 2 or length >= cfg.min_spur_length_px:
+                alignment = spur_alignment_score(path)
+                effective_length = length * alignment
+                if G.degree(curr) != 2 or (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
                     break
 
-            if length >= cfg.min_spur_length_px:
+            # Keep longer spurs. Using `effective_length` biases pruning toward skew/diagonal spurs.
+            if (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
                 continue
 
             # Only remove true spurs: a short degree-1 chain that attaches into a junction.
@@ -846,13 +868,22 @@ def extract_openings(mask_open, walls: List[Wall], cfg):
         # 0.5m tolerance
         if min_dist > 0.5: continue 
         
-        # Project on World Line
-        w_line = LineString([best_wall.start, best_wall.end])
-        p_world = Point(cx * cfg.meters_per_pixel, (mask_open.shape[0] - cy) * cfg.meters_per_pixel)
-        at_m = w_line.project(p_world)
-        
         rect = cv2.minAreaRect(cnt)
         width_m = max(rect[1]) * cfg.meters_per_pixel
+
+        # Project centroid to wall axis, then convert to "edge closest to wall.start".
+        w_line = LineString([best_wall.start, best_wall.end])
+        p_world = Point(cx * cfg.meters_per_pixel, (mask_open.shape[0] - cy) * cfg.meters_per_pixel)
+        at_center_m = w_line.project(p_world)
+        wall_len_m = w_line.length
+        edge_a = at_center_m - (width_m / 2.0)
+        edge_b = at_center_m + (width_m / 2.0)
+        if wall_len_m > 0:
+            edge_a = min(max(edge_a, 0.0), wall_len_m)
+            edge_b = min(max(edge_b, 0.0), wall_len_m)
+            at_m = min(edge_a, edge_b)
+        else:
+            at_m = 0.0
         
         openings.append(Opening(
             id=f"o_{i:03d}", type="door",
