@@ -793,7 +793,12 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--debug-dir")
-    parser.add_argument("--scale", type=float, default=0.02)
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=0.02,
+        help="Meters-per-pixel scale for converting pixels to meters.",
+    )
     args = parser.parse_args()
     
     cfg = Config(meters_per_pixel=args.scale)

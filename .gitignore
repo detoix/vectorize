@@ -8,6 +8,7 @@ venv/
 .DS_Store
 
 # Project outputs and debug files
-result.dsl
+*.dsl
+*.png
 debug/
 debug_test/
