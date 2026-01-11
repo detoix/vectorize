@@ -37,6 +37,16 @@ class Config:
     default_door_height_m: float = 2.1
     default_window_height_m: float = 1.2
     default_window_sill_m: float = 0.9
+    opening_search_dilate_px: int = 15
+    corner_gap_deviation_deg: float = 30.0
+
+    long_opening_m: float = 2.5
+    door_circularity_thresh: float = 0.25
+    door_swing_perp_factor: float = 1.5
+    door_swing_perp_min_px: float = 8.0
+    default_door_height_m: float = 2.1
+    default_window_height_m: float = 1.2
+    default_window_sill_m: float = 0.9
 
 # --- DATA STRUCTURES ---
 @dataclass
@@ -115,6 +125,175 @@ def min_axis_deviation_deg(pt_a: Tuple[float, float], pt_b: Tuple[float, float])
     return min(dist_to_0, dist_to_90, dist_to_180, dist_to_270)
 
 
+def compute_corner_intersection(
+    labels: np.ndarray,
+    jamb_a_idx: int,
+    jamb_b_idx: int,
+    pt_a: Tuple[int, int],
+    pt_b: Tuple[int, int],
+    center_opening: Tuple[int, int],
+) -> Optional[Tuple[int, int]]:
+    # Candidates
+    candidates: List[Tuple[int, int]] = []
+
+    # 1) Axis-aligned candidates.
+    candidates.append((pt_a[0], pt_b[1]))
+    candidates.append((pt_b[0], pt_a[1]))
+
+    # 2) FitLine intersection candidate.
+    mask_a = (labels == jamb_a_idx).astype(np.uint8)
+    mask_b = (labels == jamb_b_idx).astype(np.uint8)
+    pts_a = cv2.findNonZero(mask_a)
+    pts_b = cv2.findNonZero(mask_b)
+
+    if pts_a is not None and len(pts_a) > 5 and pts_b is not None and len(pts_b) > 5:
+        [vx_a, vy_a, x_a, y_a] = cv2.fitLine(pts_a, cv2.DIST_L2, 0, 0.01, 0.01)
+        [vx_b, vy_b, x_b, y_b] = cv2.fitLine(pts_b, cv2.DIST_L2, 0, 0.01, 0.01)
+
+        det = -vx_a[0] * vy_b[0] + vy_a[0] * vx_b[0]
+        if abs(det) > 0.1:
+            dx = x_b[0] - x_a[0]
+            dy = y_b[0] - y_a[0]
+            t = (dx * (-vy_b[0]) - (-vx_b[0]) * dy) / det
+            ix = x_a[0] + t * vx_a[0]
+            iy = y_a[0] + t * vy_a[0]
+            candidates.append((int(round(ix)), int(round(iy))))
+
+    # Select best candidate based on proximity to opening center (with sanity guard).
+    best_cand: Optional[Tuple[int, int]] = None
+    min_dist = float("inf")
+
+    dist_ab = math.hypot(pt_a[0] - pt_b[0], pt_a[1] - pt_b[1])
+    if dist_ab <= 1e-6:
+        return None
+
+    for c in candidates:
+        d = math.hypot(c[0] - center_opening[0], c[1] - center_opening[1])
+
+        dist_to_a = math.hypot(c[0] - pt_a[0], c[1] - pt_a[1])
+        dist_to_b = math.hypot(c[0] - pt_b[0], c[1] - pt_b[1])
+        if dist_to_a < dist_ab * 2.5 and dist_to_b < dist_ab * 2.5:
+            if d < min_dist:
+                min_dist = d
+                best_cand = c
+
+    if best_cand and min_dist < dist_ab:
+        return best_cand
+    return None
+
+
+def cut_corner_opening_in_mask(
+    mask_open: np.ndarray,
+    cnt: np.ndarray,
+    intersection: Tuple[int, int],
+    pt_a: Tuple[int, int],
+    pt_b: Tuple[int, int],
+) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """
+    Draw a 45-degree cut line through `intersection` to split a single corner-opening blob into 2.
+    Picks the +45 or -45 diagonal that best separates the two jamb components (pt_a/pt_b).
+    Returns the (p1, p2) endpoints that were used.
+    """
+    (ix, iy) = intersection
+
+    rect = cv2.minAreaRect(cnt)
+    rect_w_px, rect_h_px = rect[1]
+    max_dim = float(max(rect_w_px, rect_h_px))
+    min_dim = float(min(rect_w_px, rect_h_px))
+
+    # Long enough to traverse the opening blob, plus a little margin.
+    half_len = int(round(max(12.0, min(250.0, 0.9 * max_dim))))
+
+    def signed_side(normal: Tuple[int, int], p: Tuple[int, int]) -> float:
+        return float((p[0] - ix) * normal[0] + (p[1] - iy) * normal[1])
+
+    # For slope +1 line: normal (1,-1). For slope -1 line: normal (1,1).
+    n_pos = (1, -1)
+    n_neg = (1, 1)
+
+    sa_pos = signed_side(n_pos, pt_a)
+    sb_pos = signed_side(n_pos, pt_b)
+    sa_neg = signed_side(n_neg, pt_a)
+    sb_neg = signed_side(n_neg, pt_b)
+
+    separates_pos = (sa_pos == 0.0) or (sb_pos == 0.0) or (sa_pos * sb_pos < 0.0)
+    separates_neg = (sa_neg == 0.0) or (sb_neg == 0.0) or (sa_neg * sb_neg < 0.0)
+
+    if separates_pos and not separates_neg:
+        dir_x, dir_y = 1.0, 1.0
+    elif separates_neg and not separates_pos:
+        dir_x, dir_y = 1.0, -1.0
+    else:
+        score_pos = abs(sa_pos - sb_pos)
+        score_neg = abs(sa_neg - sb_neg)
+        if score_pos >= score_neg:
+            dir_x, dir_y = 1.0, 1.0
+        else:
+            dir_x, dir_y = 1.0, -1.0
+
+    p1 = (int(round(ix + half_len * dir_x)), int(round(iy + half_len * dir_y)))
+    p2 = (int(round(ix - half_len * dir_x)), int(round(iy - half_len * dir_y)))
+
+    h, w = mask_open.shape[:2]
+    p1 = (max(0, min(w - 1, p1[0])), max(0, min(h - 1, p1[1])))
+    p2 = (max(0, min(w - 1, p2[0])), max(0, min(h - 1, p2[1])))
+
+    # Cut with black (0) on a 1-channel mask.
+    cv2.line(mask_open, p1, p2, 0, thickness=2, lineType=cv2.LINE_8)
+    return p1, p2
+
+
+def split_corner_openings_in_mask(mask_open: np.ndarray, mask_wall: np.ndarray, debug_dir: Optional[str], cfg: Config) -> np.ndarray:
+    """
+    Corner openings can get rasterized as a single connected component (L-shaped).
+    This pass "cuts" those blobs with a 45-degree line so later `findContours` sees two openings.
+    """
+    mask_out = mask_open.copy()
+    contours, _ = cv2.findContours(mask_out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    debug_img = None
+    if debug_dir:
+        debug_img = cv2.cvtColor(mask_out, cv2.COLOR_GRAY2BGR)
+
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 10:
+            continue
+
+        ctx = get_opening_jamb_context(cnt, mask_wall, cfg)
+        if ctx is None:
+            continue
+
+        pt_a = ctx["pt_a"]
+        pt_b = ctx["pt_b"]
+        center_opening = ctx["center_opening"]
+
+        # Only split skew/corner gaps.
+        is_skew_gap = min_axis_deviation_deg(pt_a, pt_b) > cfg.corner_gap_deviation_deg
+        if not is_skew_gap:
+            continue
+
+        intersection = compute_corner_intersection(
+            labels=ctx["labels"],
+            jamb_a_idx=ctx["jamb_a_idx"],
+            jamb_b_idx=ctx["jamb_b_idx"],
+            pt_a=pt_a,
+            pt_b=pt_b,
+            center_opening=center_opening,
+        )
+        if not intersection:
+            continue
+
+        p1, p2 = cut_corner_opening_in_mask(mask_out, cnt, intersection, pt_a, pt_b)
+        if debug_img is not None:
+            cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1)
+            cv2.line(debug_img, p1, p2, (0, 255, 255), 2, lineType=cv2.LINE_8)
+
+    if debug_dir and debug_img is not None:
+        cv2.imwrite(f"{debug_dir}/00_openings_split.png", debug_img)
+
+    return mask_out
+
+
 def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
     """
     Bridges wall gaps ONLY where a blue opening exists.
@@ -145,55 +324,16 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
         is_skew_gap = min_axis_deviation_deg(pt_a, pt_b) > cfg.corner_gap_deviation_deg
 
         if is_skew_gap:
-            # Candidates
-            candidates = []
-            
-            # 1. Axis-Aligned Candidates
-            cand1 = (pt_a[0], pt_b[1])
-            cand2 = (pt_b[0], pt_a[1])
-            candidates.append(cand1)
-            candidates.append(cand2)
-
-            # 2. FitLine Candidate
-            mask_a = (labels == jamb_a_idx).astype(np.uint8)
-            mask_b = (labels == jamb_b_idx).astype(np.uint8)
-            pts_a = cv2.findNonZero(mask_a)
-            pts_b = cv2.findNonZero(mask_b)
-            
-            if pts_a is not None and len(pts_a) > 5 and pts_b is not None and len(pts_b) > 5:
-                [vx_a, vy_a, x_a, y_a] = cv2.fitLine(pts_a, cv2.DIST_L2, 0, 0.01, 0.01)
-                [vx_b, vy_b, x_b, y_b] = cv2.fitLine(pts_b, cv2.DIST_L2, 0, 0.01, 0.01)
-                
-                det = -vx_a[0]*vy_b[0] + vy_a[0]*vx_b[0]
-                if abs(det) > 0.1:
-                    dx = x_b[0] - x_a[0]
-                    dy = y_b[0] - y_a[0]
-                    t = (dx * (-vy_b[0]) - (-vx_b[0]) * dy) / det
-                    ix = x_a[0] + t * vx_a[0]
-                    iy = y_a[0] + t * vy_a[0]
-                    candidates.append((int(ix), int(iy)))
-
-            # Select Best Candidate based on proximity to opening center
-            best_cand = None
-            min_dist = float('inf')
-            
-            for c in candidates:
-                d = math.hypot(c[0]-center_opening[0], c[1]-center_opening[1])
-                # Sanity: Candidate shouldn't be wildly far from both wall ends
-                dist_to_a = math.hypot(c[0]-pt_a[0], c[1]-pt_a[1])
-                dist_to_b = math.hypot(c[0]-pt_b[0], c[1]-pt_b[1])
-                dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
-                
-                if dist_to_a < dist_ab * 2.5 and dist_to_b < dist_ab * 2.5:
-                    if d < min_dist:
-                        min_dist = d
-                        best_cand = c
-            
-            # Threshold
-            dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
-            if best_cand and min_dist < dist_ab:
+            intersection = compute_corner_intersection(
+                labels=labels,
+                jamb_a_idx=jamb_a_idx,
+                jamb_b_idx=jamb_b_idx,
+                pt_a=pt_a,
+                pt_b=pt_b,
+                center_opening=center_opening,
+            )
+            if intersection:
                 is_corner = True
-                intersection = best_cand
 
         if is_corner and intersection:
             cv2.line(union_mask, pt_a, intersection, 255, thickness=4)
@@ -203,7 +343,6 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
             cv2.line(debug_img, intersection, pt_b, (0, 255, 0), 2)
             cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1) # Mark the corner
 
-            cv2.line(mask_open, [intersection[0] + 15, intersection[1]+15], [intersection[0] - 15, intersection[1]-15], (0, 110, 100), 2) # draw a skew line that will split single opening mask in two
         else:
             cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
             cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
@@ -211,7 +350,7 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/00_robust_bridges.png", debug_img)
         
-    return [union_mask, mask_open]
+    return union_mask
 
 def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     print(f"Phase 0: Loading {path}...")
@@ -220,20 +359,23 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
     mask_wall = cv2.inRange(img_rgb, np.array([250, 250, 250]), np.array([255, 255, 255]))
-    mask_open = cv2.inRange(img_rgb, np.array([0, 0, 200]), np.array([50, 50, 255]))
+    mask_open_raw = cv2.inRange(img_rgb, np.array([0, 0, 200]), np.array([50, 50, 255]))
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.opening_bridge_px, cfg.opening_bridge_px))
-    mask_open_dilated = cv2.dilate(mask_open, kernel, iterations=1)
+    mask_open_dilated = cv2.dilate(mask_open_raw, kernel, iterations=1)
     
-    [mask_union, mask_open] = create_robust_union_mask(mask_wall, mask_open_dilated, debug_dir, cfg)
+    mask_union = create_robust_union_mask(mask_wall, mask_open_dilated, debug_dir, cfg)
     mask_union = cv2.morphologyEx(mask_union, cv2.MORPH_CLOSE, kernel)
 
     # Compute Distance Transform on SOLID WALLS only (not the bridge)
     dist_map = cv2.distanceTransform(mask_wall, cv2.DIST_L2, 5)
 
+    mask_open = split_corner_openings_in_mask(mask_open_raw, mask_wall, debug_dir, cfg)
+
     if debug_dir:
-        cv2.imwrite(f"{debug_dir}/00_union_mask.png", mask_open)
+        cv2.imwrite(f"{debug_dir}/00_union_mask.png", mask_union)
         cv2.imwrite(f"{debug_dir}/00_dist_map.png", (dist_map/dist_map.max()*255).astype(np.uint8))
+        cv2.imwrite(f"{debug_dir}/00_openings_mask.png", mask_open)
 
     return mask_union, mask_wall, mask_open, dist_map, img_rgb.shape[:2]
 
