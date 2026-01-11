@@ -12,3 +12,4 @@ venv/
 *.png
 debug/
 debug_test/
+.api_tmp/
