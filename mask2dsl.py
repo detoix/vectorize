@@ -24,7 +24,7 @@ class Config:
     snap_tol_px: float = 10.0      # Distance to snap to major axes
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 30   # Prune skeletal dead ends
+    min_spur_length_px: int = 10   # Prune skeletal dead ends
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
 
@@ -63,7 +63,7 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir):
         
         single_door_mask = np.zeros_like(mask_wall)
         cv2.drawContours(single_door_mask, [cnt], -1, 255, -1)
-        search_zone = cv2.dilate(single_door_mask, np.ones((10,10), np.uint8))
+        search_zone = cv2.dilate(single_door_mask, np.ones((15,15), np.uint8))
         nearby_walls = cv2.bitwise_and(mask_wall, search_zone)
         
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(nearby_walls)
@@ -75,9 +75,97 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir):
             
             pt_a = (int(centroids[jamb_a_idx][0]), int(centroids[jamb_a_idx][1]))
             pt_b = (int(centroids[jamb_b_idx][0]), int(centroids[jamb_b_idx][1]))
+
+            # Calculate Opening Centroid
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                center_opening = (cx, cy)
+            else:
+                center_opening = (int(np.mean(cnt[:,0,0])), int(np.mean(cnt[:,0,1])))
             
-            cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
-            cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
+            is_corner = False
+            intersection = None
+            
+            # Check for Skew Gap (Diagonal) via ANGLE
+            dx = pt_b[0] - pt_a[0]
+            dy = pt_b[1] - pt_a[1]
+            
+            angle_deg = math.degrees(math.atan2(dy, dx)) % 360
+            
+            # Deviation from nearest 90-degree axis
+            # 0, 90, 180, 270, 360
+            dist_to_0 = min(abs(angle_deg - 0), abs(angle_deg - 360))
+            dist_to_90 = abs(angle_deg - 90)
+            dist_to_180 = abs(angle_deg - 180)
+            dist_to_270 = abs(angle_deg - 270)
+            
+            min_deviation = min(dist_to_0, dist_to_90, dist_to_180, dist_to_270)
+            
+            # If the angle is more than 20 degrees off-axis, it's a diagonal (corner) gap
+            is_skew_gap = min_deviation > 30
+
+            if is_skew_gap:
+                # Candidates
+                candidates = []
+                
+                # 1. Axis-Aligned Candidates
+                cand1 = (pt_a[0], pt_b[1])
+                cand2 = (pt_b[0], pt_a[1])
+                candidates.append(cand1)
+                candidates.append(cand2)
+
+                # 2. FitLine Candidate
+                mask_a = (labels == jamb_a_idx).astype(np.uint8)
+                mask_b = (labels == jamb_b_idx).astype(np.uint8)
+                pts_a = cv2.findNonZero(mask_a)
+                pts_b = cv2.findNonZero(mask_b)
+                
+                if pts_a is not None and len(pts_a) > 5 and pts_b is not None and len(pts_b) > 5:
+                     [vx_a, vy_a, x_a, y_a] = cv2.fitLine(pts_a, cv2.DIST_L2, 0, 0.01, 0.01)
+                     [vx_b, vy_b, x_b, y_b] = cv2.fitLine(pts_b, cv2.DIST_L2, 0, 0.01, 0.01)
+                     
+                     det = -vx_a[0]*vy_b[0] + vy_a[0]*vx_b[0]
+                     if abs(det) > 0.1:
+                         dx = x_b[0] - x_a[0]
+                         dy = y_b[0] - y_a[0]
+                         t = (dx * (-vy_b[0]) - (-vx_b[0]) * dy) / det
+                         ix = x_a[0] + t * vx_a[0]
+                         iy = y_a[0] + t * vy_a[0]
+                         candidates.append((int(ix), int(iy)))
+
+                # Select Best Candidate based on proximity to opening center
+                best_cand = None
+                min_dist = float('inf')
+                
+                for c in candidates:
+                    d = math.hypot(c[0]-center_opening[0], c[1]-center_opening[1])
+                    # Sanity: Candidate shouldn't be wildly far from both wall ends
+                    dist_to_a = math.hypot(c[0]-pt_a[0], c[1]-pt_a[1])
+                    dist_to_b = math.hypot(c[0]-pt_b[0], c[1]-pt_b[1])
+                    dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
+                    
+                    if dist_to_a < dist_ab * 2.5 and dist_to_b < dist_ab * 2.5:
+                        if d < min_dist:
+                            min_dist = d
+                            best_cand = c
+                
+                # Threshold
+                dist_ab = math.hypot(pt_a[0]-pt_b[0], pt_a[1]-pt_b[1])
+                if best_cand and min_dist < dist_ab:
+                     is_corner = True
+                     intersection = best_cand
+
+            if is_corner and intersection:
+                cv2.line(union_mask, pt_a, intersection, 255, thickness=4)
+                cv2.line(union_mask, intersection, pt_b, 255, thickness=4)
+                cv2.line(debug_img, pt_a, intersection, (0, 255, 0), 2)
+                cv2.line(debug_img, intersection, pt_b, (0, 255, 0), 2)
+                cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1) # Mark the corner
+            else:
+                cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
+                cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
             
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/00_robust_bridges.png", debug_img)
