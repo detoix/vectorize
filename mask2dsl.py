@@ -359,7 +359,14 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
     mask_wall = cv2.inRange(img_rgb, np.array([250, 250, 250]), np.array([255, 255, 255]))
-    mask_open_raw = cv2.inRange(img_rgb, np.array([0, 0, 200]), np.array([50, 50, 255]))
+    # Robust opening threshold: use HSV so anti-aliased/compressed "blue" stays connected.
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lower = np.array([90, 30, 50], dtype=np.uint8)
+    upper = np.array([140, 255, 255], dtype=np.uint8)
+    mask_open_raw = cv2.inRange(hsv, lower, upper)
+    # Fill tiny gaps inside swings caused by threshold holes.
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_open_raw = cv2.morphologyEx(mask_open_raw, cv2.MORPH_CLOSE, kernel_clean)
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.opening_bridge_px, cfg.opening_bridge_px))
     mask_open_dilated = cv2.dilate(mask_open_raw, kernel, iterations=1)
@@ -373,6 +380,13 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     mask_open = split_corner_openings_in_mask(mask_open_raw, mask_wall, debug_dir, cfg)
 
     if debug_dir:
+        cv2.imwrite(f"{debug_dir}/00_openings_raw.png", mask_open_raw)
+        cv2.imwrite(f"{debug_dir}/00_openings_dilated.png", mask_open_dilated)
+        # Visualize dilated openings over wall mask (walls=white, dilated openings=blue).
+        overlay = np.zeros((mask_wall.shape[0], mask_wall.shape[1], 3), dtype=np.uint8)
+        overlay[mask_wall > 0] = (255, 255, 255)
+        overlay[mask_open_dilated > 0] = (255, 0, 0)
+        cv2.imwrite(f"{debug_dir}/00_openings_dilated_over_walls.png", overlay)
         cv2.imwrite(f"{debug_dir}/00_union_mask.png", mask_union)
         cv2.imwrite(f"{debug_dir}/00_dist_map.png", (dist_map/dist_map.max()*255).astype(np.uint8))
         cv2.imwrite(f"{debug_dir}/00_openings_mask.png", mask_open)

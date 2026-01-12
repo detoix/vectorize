@@ -23,8 +23,8 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("GOOGLE_API_KEY"), help="Google API Key.")
     parser.add_argument(
         "--prompt-file",
-        default=None,
-        help="Path to a prompt .md/.txt file (or '-' to read from stdin). If omitted, uses the built-in prompt.",
+        default="ai_extract_real_dims_prompt.md",
+        help="Path to a prompt .md/.txt file (or '-' to read from stdin). Defaults to ai_extract_real_dims_prompt.md.",
     )
     args = parser.parse_args()
 
@@ -46,7 +46,7 @@ def main():
     if args.image.lower().endswith(".jpg") or args.image.lower().endswith(".jpeg"):
         mime_type = "image/jpeg"
 
-    if args.prompt_file:
+    if args.prompt_file and args.prompt_file != "ai_extract_real_dims_prompt.md":
         if args.prompt_file == "-":
             prompt = sys.stdin.read()
         else:
@@ -56,10 +56,19 @@ def main():
             print("Error: prompt file is empty.", file=sys.stderr)
             sys.exit(1)
     else:
-        prompt = (
-            "Extract the real-world outer dimensions of the wall-union bounding box. "
-            "Return a JSON object with optional keys 'real-x' and 'real-y'."
-        )
+        # Default prompt file, with a built-in fallback for robustness.
+        prompt_path = "ai_extract_real_dims_prompt.md"
+        if os.path.exists(prompt_path):
+            with open(prompt_path, "r", encoding="utf-8") as f:
+                prompt = f.read()
+        else:
+            prompt = (
+                "Extract the real-world outer dimensions of the wall-union bounding box. "
+                "Return a JSON object with optional keys 'real-x' and 'real-y'."
+            )
+        if not prompt.strip():
+            print(f"Error: prompt file '{prompt_path}' is empty.", file=sys.stderr)
+            sys.exit(1)
 
     try:
         response = client.models.generate_content(
