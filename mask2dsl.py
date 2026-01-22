@@ -1,9 +1,8 @@
 import argparse
 import os
 import math
-import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Dict, Optional
 
 import cv2
@@ -15,31 +14,94 @@ from shapely.ops import linemerge, substring
 from scipy.spatial import cKDTree
 from scipy.ndimage import map_coordinates
 
+def _resample_thickness_from_dist_map(
+    walls: List["Wall"],
+    dist_map: np.ndarray,
+    h_img: int,
+    cfg: "Config",
+) -> None:
+    """
+    Sample thickness once after axis_offset is known.
+
+    Rationale: For walls with significant axis_offset, the snapped wall axis can run near the edge of
+    the wall mask, producing artificially small distance-transform values. Sampling along the
+    "original/baseline" axis (snapped + n_left * axis_offset) matches the wall mask centerline better.
+    """
+
+    def to_px_float(pt_m: Tuple[float, float]) -> Tuple[float, float]:
+        return (pt_m[0] / float(cfg.meters_per_pixel), float(h_img) - pt_m[1] / float(cfg.meters_per_pixel))
+
+    for w in walls:
+        dx = w.end[0] - w.start[0]
+        dy = w.end[1] - w.start[1]
+        length_m = float(math.hypot(dx, dy))
+        if length_m < 1e-9:
+            continue
+
+        # Left-hand normal.
+        nx = -dy / length_m
+        ny = dx / length_m
+
+        # Sample along baseline/original axis (visualized dashed line).
+        p1_m = (w.start[0] + nx * w.axis_offset, w.start[1] + ny * w.axis_offset)
+        p2_m = (w.end[0] + nx * w.axis_offset, w.end[1] + ny * w.axis_offset)
+        p1_px = to_px_float(p1_m)
+        p2_px = to_px_float(p2_m)
+
+        length_px = float(math.hypot(p2_px[0] - p1_px[0], p2_px[1] - p1_px[1]))
+        if length_px < 1e-6:
+            continue
+
+        num_samples = max(5, int(length_px))
+        ts = np.linspace(0.0, 1.0, num_samples, dtype=np.float32)
+
+        xs = p1_px[0] + (p2_px[0] - p1_px[0]) * ts
+        ys = p1_px[1] + (p2_px[1] - p1_px[1]) * ts
+
+        # Bilinear sample distance transform at subpixel coordinates.
+        coords = np.vstack([ys, xs])
+        vals_px = map_coordinates(dist_map, coords, order=1, mode="constant", cval=0.0).astype(np.float32)
+
+        valid = vals_px > 1.0
+        if not np.any(valid):
+            continue
+
+        # Thickness samples store half-thickness in px, and s in meters from wall.start along the wall.
+        thickness_samples: List[Tuple[float, float]] = []
+        for t, v in zip(ts.tolist(), vals_px.tolist()):
+            if v <= 1.0:
+                continue
+            thickness_samples.append((float(t) * length_m, float(v)))
+
+        if not thickness_samples:
+            continue
+
+        # Recompute wall thickness from samples.
+        vals = [v for (_s, v) in thickness_samples if v > 1.0]
+        median_dist = float(np.median(vals)) if vals else 0.0
+        thickness_px = median_dist * 2.0
+        thickness_m = thickness_px * float(cfg.meters_per_pixel)
+        if cfg.thickness_rounding_m and cfg.thickness_rounding_m > 0:
+            thickness_m = round(thickness_m / cfg.thickness_rounding_m) * cfg.thickness_rounding_m
+
+        w.thickness_samples = thickness_samples
+        w.thickness = float(thickness_m)
+
 # --- CONFIGURATION ---
 @dataclass
 class Config:
     meters_per_pixel: float = 0.02
     wall_height: float = 2.7
     default_thickness: float = 0.20 # Used if sampling fails
-    snap_tol_px: float = 10.0      # Distance to snap to major axes
+    gravity_snap_axis_snap_tol_px: float = 10.0  # Phase 3: axis snapping radius (pixels)
+    consolidate_axis_cluster_tol_m: float = 0.15  # Phase 5.5: axis clustering tolerance (meters)
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
     min_spur_length_px: int = 12   # Prune skeletal dead ends
     spur_alignment_power: float = 2.0  # >1 increases pruning bias against diagonals
+    axis_offset_min_m: float = 0.05  # Ignore tiny axis offsets (<2cm)
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
-    opening_search_dilate_px: int = 15
-    corner_gap_deviation_deg: float = 30.0
-
-    long_opening_m: float = 1.9
-    door_circularity_thresh: float = 0.25
-    door_swing_perp_factor: float = 1.5
-    door_swing_perp_min_px: float = 8.0
-    default_door_height_m: float = 2.1
-    default_window_height_m: float = 1.2
-    default_window_sill_m: float = 0.9
-    opening_search_dilate_px: int = 15
-    corner_gap_deviation_deg: float = 30.0
 
     long_opening_m: float = 2.5
     door_circularity_thresh: float = 0.25
@@ -48,6 +110,11 @@ class Config:
     default_door_height_m: float = 2.1
     default_window_height_m: float = 1.2
     default_window_sill_m: float = 0.9
+    opening_search_dilate_px: int = 15
+    corner_gap_deviation_deg: float = 30.0
+    opening_active_face_eps_px: float = 4.0
+    opening_active_face_max_pts: int = 5000
+    thickness_rounding_m: float = 0.01
 
 # --- DATA STRUCTURES ---
 @dataclass
@@ -57,7 +124,11 @@ class Wall:
     end: Tuple[float, float]
     thickness: float = 0.2
     height: float = 2.7
+    axis_offset: float = 0.0
     px_geom: Optional[LineString] = None # Original pixel geometry
+    # Thickness samples: (s_m, half_thickness_px_from_dist_transform)
+    # s_m is distance from wall.start along the wall, in meters.
+    thickness_samples: List[Tuple[float, float]] = field(default_factory=list)
 
 @dataclass
 class Opening:
@@ -92,9 +163,6 @@ def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
     jamb_a_idx = sorted_indices[0]
     jamb_b_idx = sorted_indices[1]
 
-    pt_a = (int(centroids[jamb_a_idx][0]), int(centroids[jamb_a_idx][1]))
-    pt_b = (int(centroids[jamb_b_idx][0]), int(centroids[jamb_b_idx][1]))
-
     M = cv2.moments(cnt)
     if M["m00"] != 0:
         cx = int(M["m10"] / M["m00"])
@@ -103,12 +171,77 @@ def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
     else:
         center_opening = (int(np.mean(cnt[:, 0, 0])), int(np.mean(cnt[:, 0, 1])))
 
+    # Stable representatives for junction/corner logic.
+    pt_a_centroid = (int(centroids[jamb_a_idx][0]), int(centroids[jamb_a_idx][1]))
+    pt_b_centroid = (int(centroids[jamb_b_idx][0]), int(centroids[jamb_b_idx][1]))
+
+    def component_boundary_points(component_idx: int) -> np.ndarray:
+        component_mask = (labels == component_idx).astype(np.uint8) * 255
+        if int(component_mask.max()) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        kernel = np.ones((3, 3), np.uint8)
+        boundary = cv2.morphologyEx(component_mask, cv2.MORPH_GRADIENT, kernel)
+        ys, xs = np.nonzero(boundary)
+        if xs.size == 0:
+            ys, xs = np.nonzero(component_mask)
+        if xs.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        return np.column_stack([xs, ys]).astype(np.float32)
+
+    def subsample_points(points: np.ndarray) -> np.ndarray:
+        if points.shape[0] <= cfg.opening_active_face_max_pts:
+            return points
+        step = int(math.ceil(points.shape[0] / float(cfg.opening_active_face_max_pts)))
+        return points[::step]
+
+    pts_a = subsample_points(component_boundary_points(jamb_a_idx))
+    pts_b = subsample_points(component_boundary_points(jamb_b_idx))
+
+    # "Face" representatives near the actual gap (used for drawing bridges).
+    pt_a_face: Optional[Tuple[int, int]] = None
+    pt_b_face: Optional[Tuple[int, int]] = None
+    if pts_a.shape[0] > 0 and pts_b.shape[0] > 0:
+        tree_a = cKDTree(pts_a)
+        tree_b = cKDTree(pts_b)
+
+        dists_a_to_b, _ = tree_b.query(pts_a, k=1)
+        dists_b_to_a, _ = tree_a.query(pts_b, k=1)
+        d_min = float(min(float(np.min(dists_a_to_b)), float(np.min(dists_b_to_a))))
+
+        eps = float(cfg.opening_active_face_eps_px)
+        active_a = pts_a[dists_a_to_b <= d_min + eps]
+        active_b = pts_b[dists_b_to_a <= d_min + eps]
+
+        if active_a.shape[0] > 0:
+            ca = active_a.mean(axis=0)
+            _, idx = tree_a.query(ca, k=1)
+            ax, ay = pts_a[int(idx)]
+            pt_a_face = (int(ax), int(ay))
+        if active_b.shape[0] > 0:
+            cb = active_b.mean(axis=0)
+            _, idx = tree_b.query(cb, k=1)
+            bx, by = pts_b[int(idx)]
+            pt_b_face = (int(bx), int(by))
+
+    if pt_a_face is None:
+        pt_a_face = pt_a_centroid
+    if pt_b_face is None:
+        pt_b_face = pt_b_centroid
+
     return {
         "labels": labels,
         "jamb_a_idx": jamb_a_idx,
         "jamb_b_idx": jamb_b_idx,
-        "pt_a": pt_a,
-        "pt_b": pt_b,
+        # Back-compat keys (used by older call sites): prefer "face" points.
+        "pt_a": pt_a_face,
+        "pt_b": pt_b_face,
+        # Explicit keys for stable-vs-face usage.
+        "pt_a_centroid": pt_a_centroid,
+        "pt_b_centroid": pt_b_centroid,
+        "pt_a_face": pt_a_face,
+        "pt_b_face": pt_b_face,
         "center_opening": center_opening,
     }
 
@@ -264,12 +397,12 @@ def split_corner_openings_in_mask(mask_open: np.ndarray, mask_wall: np.ndarray, 
         if ctx is None:
             continue
 
-        pt_a = ctx["pt_a"]
-        pt_b = ctx["pt_b"]
+        pt_a_centroid = ctx["pt_a_centroid"]
+        pt_b_centroid = ctx["pt_b_centroid"]
         center_opening = ctx["center_opening"]
 
         # Only split skew/corner gaps.
-        is_skew_gap = min_axis_deviation_deg(pt_a, pt_b) > cfg.corner_gap_deviation_deg
+        is_skew_gap = min_axis_deviation_deg(pt_a_centroid, pt_b_centroid) > cfg.corner_gap_deviation_deg
         if not is_skew_gap:
             continue
 
@@ -277,14 +410,14 @@ def split_corner_openings_in_mask(mask_open: np.ndarray, mask_wall: np.ndarray, 
             labels=ctx["labels"],
             jamb_a_idx=ctx["jamb_a_idx"],
             jamb_b_idx=ctx["jamb_b_idx"],
-            pt_a=pt_a,
-            pt_b=pt_b,
+            pt_a=pt_a_centroid,
+            pt_b=pt_b_centroid,
             center_opening=center_opening,
         )
         if not intersection:
             continue
 
-        p1, p2 = cut_corner_opening_in_mask(mask_out, cnt, intersection, pt_a, pt_b)
+        p1, p2 = cut_corner_opening_in_mask(mask_out, cnt, intersection, pt_a_centroid, pt_b_centroid)
         if debug_img is not None:
             cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1)
             cv2.line(debug_img, p1, p2, (0, 255, 255), 2, lineType=cv2.LINE_8)
@@ -314,39 +447,41 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
         labels = ctx["labels"]
         jamb_a_idx = ctx["jamb_a_idx"]
         jamb_b_idx = ctx["jamb_b_idx"]
-        pt_a = ctx["pt_a"]
-        pt_b = ctx["pt_b"]
+        pt_a_face = ctx["pt_a_face"]
+        pt_b_face = ctx["pt_b_face"]
+        pt_a_centroid = ctx["pt_a_centroid"]
+        pt_b_centroid = ctx["pt_b_centroid"]
         center_opening = ctx["center_opening"]
 
         is_corner = False
         intersection = None
 
         # If the angle is more than the threshold off-axis, it's a diagonal (corner) gap.
-        is_skew_gap = min_axis_deviation_deg(pt_a, pt_b) > cfg.corner_gap_deviation_deg
+        is_skew_gap = min_axis_deviation_deg(pt_a_centroid, pt_b_centroid) > cfg.corner_gap_deviation_deg
 
         if is_skew_gap:
             intersection = compute_corner_intersection(
                 labels=labels,
                 jamb_a_idx=jamb_a_idx,
                 jamb_b_idx=jamb_b_idx,
-                pt_a=pt_a,
-                pt_b=pt_b,
+                pt_a=pt_a_centroid,
+                pt_b=pt_b_centroid,
                 center_opening=center_opening,
             )
             if intersection:
                 is_corner = True
 
         if is_corner and intersection:
-            cv2.line(union_mask, pt_a, intersection, 255, thickness=4)
-            cv2.line(union_mask, intersection, pt_b, 255, thickness=4)
+            cv2.line(union_mask, pt_a_centroid, intersection, 255, thickness=4)
+            cv2.line(union_mask, intersection, pt_b_centroid, 255, thickness=4)
 
-            cv2.line(debug_img, pt_a, intersection, (0, 255, 0), 2)
-            cv2.line(debug_img, intersection, pt_b, (0, 255, 0), 2)
+            cv2.line(debug_img, pt_a_centroid, intersection, (0, 255, 0), 2)
+            cv2.line(debug_img, intersection, pt_b_centroid, (0, 255, 0), 2)
             cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1) # Mark the corner
 
         else:
-            cv2.line(union_mask, pt_a, pt_b, 255, thickness=4)
-            cv2.line(debug_img, pt_a, pt_b, (0, 0, 255), 2)
+            cv2.line(union_mask, pt_a_face, pt_b_face, 255, thickness=4)
+            cv2.line(debug_img, pt_a_face, pt_b_face, (0, 0, 255), 2)
             
     if debug_dir:
         cv2.imwrite(f"{debug_dir}/00_robust_bridges.png", debug_img)
@@ -566,7 +701,7 @@ def gravity_snap(vectors, debug_dir, cfg):
         y = w['start'][1]
         snapped = False
         for axis in axes_y:
-            if abs(axis['val'] - y) < cfg.snap_tol_px:
+            if abs(axis['val'] - y) < cfg.gravity_snap_axis_snap_tol_px:
                 w['start'][1] = axis['val']; w['end'][1] = axis['val']; snapped = True; break
         if not snapped: axes_y.append({'val': y})
 
@@ -578,9 +713,17 @@ def gravity_snap(vectors, debug_dir, cfg):
         x = w['start'][0]
         snapped = False
         for axis in axes_x:
-            if abs(axis['val'] - x) < cfg.snap_tol_px:
+            if abs(axis['val'] - x) < cfg.gravity_snap_axis_snap_tol_px:
                 w['start'][0] = axis['val']; w['end'][0] = axis['val']; snapped = True; break
         if not snapped: axes_x.append({'val': x})
+
+    # IMPORTANT: start/end may have been modified (ortho + axis snap). Keep geometry consistent so
+    # downstream sampling (distance transform) runs along the snapped segment, not the original.
+    for w in walls:
+        p1 = (float(w['start'][0]), float(w['start'][1]))
+        p2 = (float(w['end'][0]), float(w['end'][1]))
+        w['geom'] = LineString([p1, p2])
+        w['len'] = float(Point(p1).distance(Point(p2)))
 
     return walls
 
@@ -592,7 +735,7 @@ def rebuild_topology(walls, cfg):
     if not points: return []
 
     tree = cKDTree(points)
-    pairs = tree.query_pairs(cfg.snap_tol_px)
+    pairs = tree.query_pairs(cfg.gravity_snap_axis_snap_tol_px)
     pt_graph = nx.Graph()
     for i in range(len(points)): pt_graph.add_node(i)
     pt_graph.add_edges_from(list(pairs))
@@ -613,7 +756,8 @@ def rebuild_topology(walls, cfg):
             
         final_walls.append({
             'start': ns, 'end': ne,
-            'px_geom': w['geom'], 'px_len': w['len']
+            'px_geom': LineString([ns, ne]),
+            'px_len': float(Point(ns).distance(Point(ne))),
         })
     return final_walls
 
@@ -623,28 +767,14 @@ def process_attributes(walls, dist_map, h_img, cfg):
     wall_objs = []
     
     for i, w in enumerate(walls):
-        # 1. Thickness Sampling (Ignore Bridge Zeros)
-        line = w['px_geom']
-        length = line.length
-        num_samples = max(5, int(length)) 
-        samples = [line.interpolate(n) for n in np.linspace(0, length, num_samples)]
+        tmp_id = f"tmp_{i}"
+        # NOTE: Wall thickness is sampled later (after axis_offset is known), to avoid sampling
+        # on a snapped axis that can run along the wall mask edge.
+        thickness_m = float(cfg.default_thickness)
+        if cfg.thickness_rounding_m and cfg.thickness_rounding_m > 0:
+            thickness_m = round(thickness_m / cfg.thickness_rounding_m) * cfg.thickness_rounding_m
         
-        vals = []
-        for p in samples:
-            if 0 <= p.y < dist_map.shape[0] and 0 <= p.x < dist_map.shape[1]:
-                val = dist_map[int(p.y), int(p.x)]
-                if val > 1.0: vals.append(val) # Filter out the bridge pixels
-                
-        if vals:
-            thickness_px = np.median(vals) * 2
-        else:
-            thickness_px = (cfg.default_thickness / cfg.meters_per_pixel)
-            
-        thickness_m = thickness_px * cfg.meters_per_pixel
-        # Round to nearest 5cm
-        thickness_m = round(thickness_m / 0.05) * 0.05
-        
-        # 2. Coordinate Transform
+        # Coordinate Transform
         sx, sy = w['start']; ex, ey = w['end']
         wx1 = sx * cfg.meters_per_pixel
         wy1 = (h_img - sy) * cfg.meters_per_pixel
@@ -654,11 +784,15 @@ def process_attributes(walls, dist_map, h_img, cfg):
         if wx1 > wx2 or (abs(wx1 - wx2) < 1e-4 and wy1 > wy2):
             wx1, wy1, wx2, wy2 = wx2, wy2, wx1, wy1
             
+        thickness_samples_m: List[Tuple[float, float]] = []
+
         wall_objs.append(Wall(
-            id=f"tmp_{i}", # Temp ID
+            id=tmp_id, # Temp ID
             start=(wx1, wy1), end=(wx2, wy2),
             thickness=thickness_m, height=cfg.wall_height,
-            px_geom=w['px_geom']
+            axis_offset=0.0,
+            px_geom=w['px_geom'],
+            thickness_samples=thickness_samples_m,
         ))
     return wall_objs
 
@@ -688,7 +822,7 @@ def consolidate_walls(walls: List[Wall], cfg):
             # Check if on same axis (within tolerance)
             if is_w1_vert:
                 axis_diff = abs(w1.start[0] - w2.start[0])
-                if axis_diff > 0.15: continue
+                if axis_diff > float(cfg.consolidate_axis_cluster_tol_m): continue
                 
                 # Check overlap on Y axis
                 w1_min_y, w1_max_y = min(w1.start[1], w1.end[1]), max(w1.start[1], w1.end[1])
@@ -703,7 +837,7 @@ def consolidate_walls(walls: List[Wall], cfg):
                     break
             else:  # Horizontal
                 axis_diff = abs(w1.start[1] - w2.start[1])
-                if axis_diff > 0.15: continue
+                if axis_diff > float(cfg.consolidate_axis_cluster_tol_m): continue
                 
                 # Check overlap on X axis
                 w1_min_x, w1_max_x = min(w1.start[0], w1.end[0]), max(w1.start[0], w1.end[0])
@@ -734,8 +868,8 @@ def consolidate_walls(walls: List[Wall], cfg):
     # Grouping Helper
     def cluster_and_merge(walls_subset, is_horiz):
         # 1. Cluster by primary axis (Y for horiz, X for vert)
-        # Tolerance: 0.15m (15cm) to catch slightly jagged walls
-        TOL = 0.15 
+        # Tolerance: meters, to catch slightly jagged walls
+        TOL = float(cfg.consolidate_axis_cluster_tol_m)
         groups = [] # List of {'val': float, 'walls': []}
         
         idx = 1 if is_horiz else 0 # Primary axis index
@@ -817,12 +951,6 @@ def consolidate_walls(walls: List[Wall], cfg):
         
         group = cleaned_group
         
-        # Debug: Print cleaned group size
-        if len(group) > 0 and abs(group[0].start[is_horiz and 1 or 0] - 2.419) < 0.05:
-            print(f"DEBUG MERGE_GROUP x=2.419. Count: {len(group)}")
-            for w in group:
-                print(f"  W: {w.start[idx]:.3f} -> {w.end[idx]:.3f}, t={w.thickness:.2f}")
-
         group.sort(key=lambda w: w.start[idx])
         merged = []
         if not group: return []
@@ -887,6 +1015,14 @@ def consolidate_walls(walls: List[Wall], cfg):
             if gap < 0.2 and is_simple_joint:
                 # Merge
                 current.thickness = max(current.thickness, next_w.thickness)
+                if next_w.thickness_samples:
+                    if is_horiz:
+                        offset = float(next_w.start[0] - current.start[0])
+                    else:
+                        offset = float(next_w.start[1] - current.start[1])
+                    if offset < 0:
+                        offset = -offset
+                    current.thickness_samples.extend([(s + offset, v) for (s, v) in next_w.thickness_samples])
                 if is_horiz: current.end = (next_w.end[0], current.end[1])
                 else: current.end = (current.end[0], next_w.end[1])
             else:
@@ -986,13 +1122,18 @@ def consolidate_walls(walls: List[Wall], cfg):
                 for a, b in zip(coords, coords[1:]):
                     if (b - a) < min_seg_len:
                         continue
+                    s0 = float(a - x0)
+                    s1 = float(b - x0)
+                    child_samples = [(s - s0, v) for (s, v) in w.thickness_samples if s0 <= s <= s1]
                     result.append(Wall(
                         id=w.id,
                         start=(a, y),
                         end=(b, y),
                         thickness=w.thickness,
                         height=w.height,
+                        axis_offset=w.axis_offset,
                         px_geom=None,
+                        thickness_samples=child_samples,
                     ))
             else:
                 x = w.start[0]
@@ -1015,19 +1156,29 @@ def consolidate_walls(walls: List[Wall], cfg):
                 for a, b in zip(coords, coords[1:]):
                     if (b - a) < min_seg_len:
                         continue
+                    s0 = float(a - y0)
+                    s1 = float(b - y0)
+                    child_samples = [(s - s0, v) for (s, v) in w.thickness_samples if s0 <= s <= s1]
                     result.append(Wall(
                         id=w.id,
                         start=(x, a),
                         end=(x, b),
                         thickness=w.thickness,
                         height=w.height,
+                        axis_offset=w.axis_offset,
                         px_geom=None,
+                        thickness_samples=child_samples,
                     ))
         return result
 
     final_walls = split_walls_at_t_junctions(final_walls)
+
+    for w in final_walls:
+        if abs(w.axis_offset) < cfg.axis_offset_min_m:
+            w.axis_offset = 0.0
         
-    for i, w in enumerate(final_walls): w.id = f"w_{i:03d}"
+    for i, w in enumerate(final_walls):
+        w.id = f"w_{i:03d}"
     return final_walls
 
 # --- PHASE 6: OPENINGS ---
@@ -1148,13 +1299,18 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
     return openings
 
 # --- PHASE 7: EMIT ---
-def emit_dsl(walls: List[Wall], openings: List[Opening]):
+def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
     lines = ['level("L1").elev(0)']
     walls.sort(key=lambda x: x.id)
     
     for w in walls:
-        lines.append(f'wall("{w.id}").from({w.start[0]:.3f},{w.start[1]:.3f})'
-                     f'.to({w.end[0]:.3f},{w.end[1]:.3f}).t({w.thickness:.2f}).h({w.height})')
+        line = (
+            f'wall("{w.id}").from({w.start[0]:.3f},{w.start[1]:.3f})'
+            f'.to({w.end[0]:.3f},{w.end[1]:.3f}).t({w.thickness:.2f}).h({w.height})'
+        )
+        if abs(w.axis_offset) >= cfg.axis_offset_min_m:
+            line += f'.off({w.axis_offset:.3f})'
+        lines.append(line)
         
     openings.sort(key=lambda x: (x.wall_id, x.at))
     for o in openings:
@@ -1169,6 +1325,101 @@ def emit_dsl(walls: List[Wall], openings: List[Opening]):
                 f'.w({o.width:.3f}).h({o.height})'
             )
     return "\n".join(lines)
+
+def build_walls_from_masks(mask_union, dist_map, dims, cfg: Config, debug_dir: Optional[str]):
+    skel_graph = build_skeleton_graph(mask_union, debug_dir, cfg)
+    raw_vectors = graph_to_vectors(skel_graph, debug_dir, cfg)
+    snapped_walls = gravity_snap(raw_vectors, debug_dir, cfg)
+    final_topology = rebuild_topology(snapped_walls, cfg)
+    walls_raw = process_attributes(final_topology, dist_map, dims[0], cfg)
+    walls_merged = consolidate_walls(walls_raw, cfg)
+    return walls_merged
+
+def compute_axis_offset_from_baseline(
+    snapped: Wall,
+    baseline_walls: List[Wall],
+    cfg: Config,
+    min_overlap_m: float = 0.1,
+    axis_slack_m: float = 0.02,
+) -> float:
+    dx = snapped.end[0] - snapped.start[0]
+    dy = snapped.end[1] - snapped.start[1]
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return 0.0
+
+    # Left-hand normal of snapped wall direction.
+    n_left = (-dy / length, dx / length)
+
+    is_horiz = abs(dx) >= abs(dy)
+    if is_horiz:
+        axis_s = (snapped.start[1] + snapped.end[1]) * 0.5
+        s0, s1 = sorted([snapped.start[0], snapped.end[0]])
+    else:
+        axis_s = (snapped.start[0] + snapped.end[0]) * 0.5
+        s0, s1 = sorted([snapped.start[1], snapped.end[1]])
+
+    def overlap_len(a0: float, a1: float, b0: float, b1: float) -> float:
+        return max(0.0, min(a1, b1) - max(a0, b0))
+
+    # Allow matching up to the snap radius (in meters) plus a small buffer.
+    axis_match_tol_m = max(
+        float(cfg.gravity_snap_axis_snap_tol_px) * float(cfg.meters_per_pixel) + 0.05,
+        0.25,
+    )
+
+    # candidates are (abs_axis_diff, axis_diff, overlap_len_m)
+    candidates: List[Tuple[float, float, float]] = []
+    for b in baseline_walls:
+        bdx = b.end[0] - b.start[0]
+        bdy = b.end[1] - b.start[1]
+        b_is_horiz = abs(bdx) >= abs(bdy)
+        if b_is_horiz != is_horiz:
+            continue
+
+        if is_horiz:
+            axis_b = (b.start[1] + b.end[1]) * 0.5
+            b0, b1 = sorted([b.start[0], b.end[0]])
+        else:
+            axis_b = (b.start[0] + b.end[0]) * 0.5
+            b0, b1 = sorted([b.start[1], b.end[1]])
+
+        ov = overlap_len(s0, s1, b0, b1)
+        axis_diff = axis_b - axis_s
+        if ov < min_overlap_m:
+            continue
+
+        if abs(axis_diff) > axis_match_tol_m:
+            continue
+        candidates.append((abs(axis_diff), axis_diff, ov))
+
+    if not candidates:
+        return 0.0
+
+    min_abs = min(d for d, _axis_diff, _ov in candidates)
+
+    total_w = 0.0
+    total_off = 0.0
+    for abs_axis_diff, axis_diff, ov in candidates:
+        if abs_axis_diff > (min_abs + axis_slack_m):
+            continue
+        # Convert axis coordinate delta into a world XY shift and project onto snapped left normal.
+        if is_horiz:
+            shift = (0.0, axis_diff)
+        else:
+            shift = (axis_diff, 0.0)
+        off = shift[0] * n_left[0] + shift[1] * n_left[1]
+        total_off += off * ov
+        total_w += ov
+
+    if total_w <= 1e-9:
+        return 0.0
+
+    axis_offset_raw = total_off / total_w
+    axis_offset = axis_offset_raw
+    if abs(axis_offset) < cfg.axis_offset_min_m:
+        axis_offset = 0.0
+    return axis_offset
 
 # --- MAIN ---
 def main():
@@ -1185,32 +1436,106 @@ def main():
     args = parser.parse_args()
     
     cfg = Config(meters_per_pixel=args.scale)
-    if args.debug_dir: os.makedirs(args.debug_dir, exist_ok=True)
+    if args.debug_dir:
+        os.makedirs(args.debug_dir, exist_ok=True)
         
     mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
-    skel_graph = build_skeleton_graph(mask_union, args.debug_dir, cfg)
-    raw_vectors = graph_to_vectors(skel_graph, args.debug_dir, cfg)
-    snapped_walls = gravity_snap(raw_vectors, args.debug_dir, cfg)
-    final_topology = rebuild_topology(snapped_walls, cfg)
-    
-    # 1. Attributes (Raw)
-    walls_raw = process_attributes(final_topology, dist_map, dims[0], cfg)
-    # 2. Consolidation (Merge + Junction Check)
-    walls_merged = consolidate_walls(walls_raw, cfg)
+
+    # Two-pass axis offset:
+    # - baseline run turns off Phase 3 axis snapping and Phase 5.5 axis clustering to avoid implicit alignment
+    # - snapped run uses cfg.gravity_snap_axis_snap_tol_px and cfg.consolidate_axis_cluster_tol_m
+    baseline_cfg = replace(
+        cfg,
+        gravity_snap_axis_snap_tol_px=0.0,
+        consolidate_axis_cluster_tol_m=0.0,
+    )
+    baseline_walls = build_walls_from_masks(mask_union, dist_map, dims, baseline_cfg, debug_dir=None)
+
+    # Build the snapped walls (with full debug output).
+    walls_merged = build_walls_from_masks(mask_union, dist_map, dims, cfg, args.debug_dir)
+
+    # Assign axis_offset for each snapped wall as the delta to the baseline axes.
+    for w in walls_merged:
+        w.axis_offset = compute_axis_offset_from_baseline(w, baseline_walls, cfg)
+
+    # Re-sample thickness after axis_offset is known (helps walls with large offsets).
+    _resample_thickness_from_dist_map(walls_merged, dist_map, dims[0], cfg)
+
     # 3. Openings (Map to merged)
     openings = extract_openings(mask_open, mask_wall, walls_merged, cfg)
     
     with open(args.out, "w") as f:
-        f.write(emit_dsl(walls_merged, openings))
+        f.write(emit_dsl(walls_merged, openings, cfg))
     print(f"Done! Written to {args.out}")
 
     if args.debug_dir:
         orig = cv2.imread(args.input)
         h, w_img = dims
+
+        def to_px(pt_m: Tuple[float, float]) -> Tuple[int, int]:
+            return (
+                int(round(pt_m[0] / cfg.meters_per_pixel)),
+                int(round(h - pt_m[1] / cfg.meters_per_pixel)),
+            )
+
+        def draw_dashed_line(
+            img: np.ndarray,
+            p1: Tuple[int, int],
+            p2: Tuple[int, int],
+            color: Tuple[int, int, int],
+            thickness: int = 1,
+            dash_len: int = 10,
+            gap_len: int = 6,
+        ) -> None:
+            x1, y1 = p1
+            x2, y2 = p2
+            dist = math.hypot(x2 - x1, y2 - y1)
+            if dist < 1.0:
+                return
+            vx = (x2 - x1) / dist
+            vy = (y2 - y1) / dist
+            cur = 0.0
+            while cur < dist:
+                seg_end = min(cur + dash_len, dist)
+                sx = int(round(x1 + vx * cur))
+                sy = int(round(y1 + vy * cur))
+                ex = int(round(x1 + vx * seg_end))
+                ey = int(round(y1 + vy * seg_end))
+                cv2.line(img, (sx, sy), (ex, ey), color, thickness)
+                cur += dash_len + gap_len
         for w in walls_merged:
-            p1 = (int(w.start[0] / cfg.meters_per_pixel), int(h - w.start[1] / cfg.meters_per_pixel))
-            p2 = (int(w.end[0] / cfg.meters_per_pixel), int(h - w.end[1] / cfg.meters_per_pixel))
+            p1 = to_px(w.start)
+            p2 = to_px(w.end)
             cv2.line(orig, p1, p2, (0, 255, 0), 2)
+
+            # Draw original (pre-snap) axis implied by axis_offset: snapped + normal_left * axis_offset
+            if abs(w.axis_offset) >= cfg.axis_offset_min_m:
+                dx = w.end[0] - w.start[0]
+                dy = w.end[1] - w.start[1]
+                length = math.hypot(dx, dy)
+                if length > 1e-9:
+                    nx = -dy / length
+                    ny = dx / length
+                    s1_m = (w.start[0] + nx * w.axis_offset, w.start[1] + ny * w.axis_offset)
+                    s2_m = (w.end[0] + nx * w.axis_offset, w.end[1] + ny * w.axis_offset)
+                    s1 = to_px(s1_m)
+                    s2 = to_px(s2_m)
+                    draw_dashed_line(orig, s1, s2, (255, 0, 255), thickness=1)
+
+                    mid_m = ((w.start[0] + w.end[0]) * 0.5, (w.start[1] + w.end[1]) * 0.5)
+                    mid_off_m = (mid_m[0] + nx * w.axis_offset, mid_m[1] + ny * w.axis_offset)
+                    mid = to_px(mid_m)
+                    mid_off = to_px(mid_off_m)
+                    cv2.arrowedLine(orig, mid, mid_off, (0, 165, 255), 1, tipLength=0.35)
+                    cv2.putText(
+                        orig,
+                        f"{w.axis_offset:+.3f}m",
+                        (mid_off[0] + 4, mid_off[1] + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        (255, 0, 255),
+                        1,
+                    )
             # Place label at 10% along the wall from the start point
             lx = int(round(p1[0] + 0.2 * (p2[0] - p1[0])))
             ly = int(round(p1[1] + 0.2 * (p2[1] - p1[1])))
