@@ -99,7 +99,10 @@ class Config:
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
     min_spur_length_px: int = 12   # Prune skeletal dead ends
     spur_alignment_power: float = 2.0  # >1 increases pruning bias against diagonals
-    axis_offset_min_m: float = 0.05  # Ignore tiny axis offsets (<2cm)
+    axis_offset_min_m: float = 0.06  # Ignore tiny axis offsets (<2cm)
+    axis_offset_min_overlap_m: float = 0.10  # Baseline overlap required (meters)
+    axis_offset_sigma_m: float = 0.10  # Soft weighting length scale for axis matching (meters)
+    orthogonal_junction_snap_m: float = 0.2  # Max endpoint shift to meet perpendicular wall (meters)
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
 
@@ -110,6 +113,7 @@ class Config:
     default_door_height_m: float = 2.1
     default_window_height_m: float = 1.2
     default_window_sill_m: float = 0.9
+    opening_wall_max_dist_m: float = 1.2  # Max centroid-to-wall distance for assigning an opening
     opening_search_dilate_px: int = 15
     corner_gap_deviation_deg: float = 30.0
     opening_active_face_eps_px: float = 4.0
@@ -1171,6 +1175,79 @@ def consolidate_walls(walls: List[Wall], cfg):
                     ))
         return result
 
+    def extend_clip_orthogonal_junctions(walls_in: List[Wall], tol_m: float) -> None:
+        """
+        Extend/clip axis-aligned wall endpoints so they meet perpendicular walls.
+
+        This only moves endpoints along the wall axis (x for horizontals, y for verticals), keeping
+        walls perfectly horizontal/vertical. It does not "shift" an axis (that's axis_offset).
+        """
+        tol_m = float(tol_m)
+        if tol_m <= 0.0:
+            return
+
+        horiz: List[Tuple[Wall, float, float, float]] = []  # (wall, y, x0, x1)
+        vert: List[Tuple[Wall, float, float, float]] = []   # (wall, x, y0, y1)
+
+        for w in walls_in:
+            dx = abs(w.end[0] - w.start[0])
+            dy = abs(w.end[1] - w.start[1])
+            if dx < 1e-9 and dy < 1e-9:
+                continue
+            if dx >= dy:
+                y = (w.start[1] + w.end[1]) * 0.5
+                x0, x1 = sorted([w.start[0], w.end[0]])
+                horiz.append((w, y, x0, x1))
+            else:
+                x = (w.start[0] + w.end[0]) * 0.5
+                y0, y1 = sorted([w.start[1], w.end[1]])
+                vert.append((w, x, y0, y1))
+
+        def normalize(w: Wall) -> None:
+            wx1, wy1 = w.start
+            wx2, wy2 = w.end
+            if wx1 > wx2 or (abs(wx1 - wx2) < 1e-4 and wy1 > wy2):
+                w.start, w.end = w.end, w.start
+
+        # Snap horizontal endpoints to nearby vertical axes.
+        for w, y, _x0, _x1 in horiz:
+            for which in ("start", "end"):
+                x0, y0 = getattr(w, which)
+                best_x = None
+                best_d = float("inf")
+                for _vw, x_v, y_v0, y_v1 in vert:
+                    if y < (y_v0 - tol_m) or y > (y_v1 + tol_m):
+                        continue
+                    d = abs(x_v - x0)
+                    if d <= tol_m and d < best_d:
+                        best_d = d
+                        best_x = x_v
+                if best_x is not None:
+                    setattr(w, which, (float(best_x), float(y)))
+            normalize(w)
+
+        # Snap vertical endpoints to nearby horizontal axes.
+        for w, x, _y0, _y1 in vert:
+            for which in ("start", "end"):
+                x0, y0 = getattr(w, which)
+                best_y = None
+                best_d = float("inf")
+                for _hw, y_h, x_h0, x_h1 in horiz:
+                    if x < (x_h0 - tol_m) or x > (x_h1 + tol_m):
+                        continue
+                    d = abs(y_h - y0)
+                    if d <= tol_m and d < best_d:
+                        best_d = d
+                        best_y = y_h
+                if best_y is not None:
+                    setattr(w, which, (float(x), float(best_y)))
+            normalize(w)
+
+        # Final normalization pass (in case both ends moved).
+        for w in walls_in:
+            normalize(w)
+
+    extend_clip_orthogonal_junctions(final_walls, cfg.orthogonal_junction_snap_m)
     final_walls = split_walls_at_t_junctions(final_walls)
 
     for w in final_walls:
@@ -1214,8 +1291,9 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
                 min_dist = dist
                 best_wall = w
         
-        # 0.5m tolerance
-        if min_dist > 0.5: continue 
+        # Max distance (meters) between opening centroid and wall axis.
+        if min_dist > float(cfg.opening_wall_max_dist_m):
+            continue
         
         rect = cv2.minAreaRect(cnt)
         rect_w_px, rect_h_px = rect[1]
@@ -1339,9 +1417,14 @@ def compute_axis_offset_from_baseline(
     snapped: Wall,
     baseline_walls: List[Wall],
     cfg: Config,
-    min_overlap_m: float = 0.1,
-    axis_slack_m: float = 0.02,
+    min_overlap_m: Optional[float] = None,
+    sigma_m: Optional[float] = None,
 ) -> float:
+    if min_overlap_m is None:
+        min_overlap_m = float(cfg.axis_offset_min_overlap_m)
+    if sigma_m is None:
+        sigma_m = float(cfg.axis_offset_sigma_m)
+
     dx = snapped.end[0] - snapped.start[0]
     dy = snapped.end[1] - snapped.start[1]
     length = math.hypot(dx, dy)
@@ -1368,8 +1451,10 @@ def compute_axis_offset_from_baseline(
         0.25,
     )
 
-    # candidates are (abs_axis_diff, axis_diff, overlap_len_m)
-    candidates: List[Tuple[float, float, float]] = []
+    # Weighted average over baseline candidates:
+    # weight = overlap_len_m * exp(-(abs_axis_diff / sigma_m)^2)
+    # This avoids tiny-overlap stubs "winning" purely because they are closest in axis.
+    candidates: List[Tuple[float, float, float]] = []  # (abs_axis_diff, axis_diff, overlap_len_m)
     for b in baseline_walls:
         bdx = b.end[0] - b.start[0]
         bdy = b.end[1] - b.start[1]
@@ -1396,12 +1481,12 @@ def compute_axis_offset_from_baseline(
     if not candidates:
         return 0.0
 
-    min_abs = min(d for d, _axis_diff, _ov in candidates)
-
+    sigma_m = max(float(sigma_m), 1e-6)
     total_w = 0.0
     total_off = 0.0
     for abs_axis_diff, axis_diff, ov in candidates:
-        if abs_axis_diff > (min_abs + axis_slack_m):
+        weight = float(ov) * math.exp(-((float(abs_axis_diff) / sigma_m) ** 2))
+        if weight <= 0.0:
             continue
         # Convert axis coordinate delta into a world XY shift and project onto snapped left normal.
         if is_horiz:
@@ -1409,8 +1494,8 @@ def compute_axis_offset_from_baseline(
         else:
             shift = (axis_diff, 0.0)
         off = shift[0] * n_left[0] + shift[1] * n_left[1]
-        total_off += off * ov
-        total_w += ov
+        total_off += float(off) * weight
+        total_w += weight
 
     if total_w <= 1e-9:
         return 0.0
