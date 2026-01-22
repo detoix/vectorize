@@ -24,7 +24,8 @@ class Config:
     snap_tol_px: float = 10.0      # Distance to snap to major axes
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 15   # Prune skeletal dead ends
+    min_spur_length_px: int = 12   # Prune skeletal dead ends
+    spur_alignment_power: float = 2.0  # >1 increases pruning bias against diagonals
     opening_bridge_px: int = 3     # Dilation size for Blue Bridge
     epsilon_rdp: float = 3.0       # RDP simplification epsilon
     opening_search_dilate_px: int = 15
@@ -462,7 +463,7 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
                 prev, curr = curr, nxt
 
                 alignment = spur_alignment_score(path)
-                effective_length = length * alignment
+                effective_length = length * (alignment ** float(cfg.spur_alignment_power))
                 if G.degree(curr) != 2 or (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
                     break
 
