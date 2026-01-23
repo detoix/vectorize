@@ -284,8 +284,9 @@ class Config:
     consolidate_axis_cluster_tol_m: float = 0.15  # Phase 5.5: axis clustering tolerance (meters)
     collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
     ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 12   # Prune skeletal dead ends
+    min_spur_length_px: int = 10   # Prune skeletal dead ends
     spur_alignment_power: float = 2.0  # >1 increases pruning bias against diagonals
+    extension_max_px: int = 10 # Max pixels to extend skeleton ends
     axis_offset_min_m: float = 0.06  # Ignore tiny axis offsets (<2cm)
     axis_offset_min_overlap_m: float = 0.10  # Baseline overlap required (meters)
     axis_offset_sigma_m: float = 0.10  # Soft weighting length scale for axis matching (meters)
@@ -765,15 +766,78 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
         uy = abs(dy) / norm
         return max(ux, uy)
 
-    # Prune Spurs
-    # Walk outward from every degree-1 node until we hit a junction (deg>=3) or the path gets long enough.
-    # Using a `prev` pointer is critical here; relying on neighbor ordering makes pruning nondeterministic.
+    # --- STEP 1: EXTEND ENDS (Before Pruning) ---
+    # We extend ALL ends (including noise) to the wall boundary.
+    # This gives short valid walls a chance to survive pruning if extension makes them long enough.
+    
+    # Identify ends
+    initial_ends = [n for n in G.nodes() if G.degree(n) == 1]
+    
+    for end_node in initial_ends:
+        if G.degree(end_node) != 1: continue # Safety if graph changed? (unlikely here)
+        
+        nbrs = list(G.neighbors(end_node))
+        if not nbrs: continue
+        prev_node = nbrs[0]
+        
+        # Direction: Prev -> End
+        dx = float(end_node[0] - prev_node[0])
+        dy = float(end_node[1] - prev_node[1])
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9: continue
+        
+        ux, uy = dx/norm, dy/norm
+        
+        # Raycast
+        curr_x, curr_y = float(end_node[0]), float(end_node[1])
+        
+        extended_pixels = []
+        max_dist = float(cfg.extension_max_px)
+        dist_accum = 0.0
+        
+        while dist_accum < max_dist:
+            curr_x += ux
+            curr_y += uy
+            dist_accum += 1.0
+            
+            ix, iy = int(round(curr_x)), int(round(curr_y))
+            
+            # Bounds check
+            if ix < 0 or iy < 0 or ix >= mask_union.shape[1] or iy >= mask_union.shape[0]:
+                break
+                
+            # Content check (0=background)
+            if mask_union[iy, ix] == 0:
+                break
+            
+            # Add intermediate pixels to graph to maintain connectivity geometry?
+            if (ix, iy) not in G: 
+                extended_pixels.append((ix, iy))
+        
+        # If we extended anything
+        if extended_pixels:
+            prev_p = end_node
+            for p in extended_pixels:
+                G.add_node(p)
+                dist = math.hypot(p[0]-prev_p[0], p[1]-prev_p[1])
+                G.add_edge(prev_p, p, weight=dist)
+                prev_p = p
+
+    # --- STEP 2: SYMMETRIC PRUNING (After Extension) ---
+    # Now prune spurs. Since valid ends are extended to the wall face, they should be long enough to survive.
+    # Short noise spurs that didn't extend much (or were very short to begin with) will be pruned.
+    
     while True:
         pruned_any = False
+        
+        # Identify all potential spur tips (degree 1)
         deg1_nodes = [n for n in G.nodes() if G.degree(n) == 1]
+        
+        # Map Junction -> List of (spur_tip, entire_path, effective_length)
+        junction_spurs = defaultdict(list)
+        
         for start in deg1_nodes:
-            if not G.has_node(start) or G.degree(start) != 1:
-                continue
+            if not G.has_node(start): continue # Already removed in this pass?
 
             path = [start]
             length = 0.0
@@ -781,11 +845,13 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
             curr = start
             alignment = 1.0
             effective_length = 0.0
-
+            
+            # Walk up the spur
             while True:
                 nbrs = list(G.neighbors(curr))
                 next_candidates = [n for n in nbrs if n != prev]
                 if not next_candidates:
+                    # Isolated line or loop? Stop.
                     break
 
                 nxt = next_candidates[0]
@@ -795,16 +861,27 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
 
                 alignment = spur_alignment_score(path)
                 effective_length = length * (alignment ** float(cfg.spur_alignment_power))
-                if G.degree(curr) != 2 or (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
+                
+                # Check if we hit a true junction (degree > 2) OR if path is too long
+                if G.degree(curr) > 2 or (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
                     break
 
-            # Keep longer spurs. Using `effective_length` biases pruning toward skew/diagonal spurs.
-            if (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
-                continue
+            # If meaningful spur attached to a junction
+            if (effective_length + 1e-9) < float(cfg.min_spur_length_px) and G.degree(curr) >= 3:
+                junction_spurs[curr].append({
+                    'tip': start,
+                    'path': path, # distinct nodes from tip to junction (curr is last, not pruned)
+                    'len': effective_length
+                })
 
-            # Only remove true spurs: a short degree-1 chain that attaches into a junction.
-            if G.has_node(curr) and G.degree(curr) >= 3:
-                for p in path[:-1]:
+        # Process junctions
+        for junction, spurs in junction_spurs.items():
+            # If a junction has spurs, we prune them. 
+            
+            for spur_info in spurs:
+                # Prune nodes in path UP TO (but not including) the junction
+                nodes_to_remove = spur_info['path'][:-1]
+                for p in nodes_to_remove:
                     if G.has_node(p):
                         G.remove_node(p)
                         pruned_any = True
