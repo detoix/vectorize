@@ -2,12 +2,20 @@ import argparse
 import cgi
 import json
 import os
+import subprocess
+import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from pipeline_lib import PipelineError, run_vectorize_pipeline
+from extract_scale import (
+    derive_isotropic_meters_per_pixel,
+    load_real_dims_from_payload,
+    wall_bbox_from_mask,
+    wall_mask_from_image_rgb,
+)
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
@@ -64,17 +72,26 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/run":
-            self._send_json(404, {"ok": False, "error": "Not found"})
-            return
-
         repo_root = getattr(self.server, "repo_root", os.getcwd())
+        raw_path = (self.path or "").split("?", 1)[0]
+        path = raw_path.rstrip("/") or "/"
         content_type = self.headers.get("Content-Type", "")
-        if content_type.startswith("multipart/form-data"):
-            self._handle_run_multipart(repo_root, content_type)
+
+        if path == "/run":
+            if content_type.startswith("multipart/form-data"):
+                self._handle_run_multipart(repo_root, content_type)
+                return
+            self._handle_run_json(repo_root)
             return
 
-        self._handle_run_json(repo_root)
+        if path == "/":
+            if content_type.startswith("multipart/form-data"):
+                self._handle_mask2dsl_multipart(repo_root, content_type)
+                return
+            self._handle_mask2dsl_json(repo_root)
+            return
+
+        self._send_json(404, {"ok": False, "error": "Not found"})
 
     def _handle_run_json(self, repo_root: str) -> None:
         try:
@@ -209,6 +226,242 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
         dsl = _read_text_file(dsl_path, max_chars=max_dsl_chars)
         if response_format == "json":
             self._send_json(200, {"dsl": dsl})
+        else:
+            self._send_text(200, dsl)
+
+    def _handle_mask2dsl_json(self, repo_root: str) -> None:
+        try:
+            body = _read_json_body(self)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        dims = body.get("dims") or body.get("real_dims") or body.get("realDims")
+        if not isinstance(dims, dict):
+            self._send_json(400, {"ok": False, "error": "Field 'dims' (object) is required"})
+            return
+
+        mask_b64 = body.get("mask_b64") or body.get("image_b64")
+        if not mask_b64 or not isinstance(mask_b64, str):
+            self._send_json(400, {"ok": False, "error": "Field 'mask_b64' (base64 string) is required"})
+            return
+
+        response_format = (body.get("format") or body.get("responseFormat") or "text").lower()
+        max_dsl_chars = int(body.get("max_dsl_chars") or body.get("maxDslChars") or 200000)
+
+        import base64
+        import numpy as np
+        import cv2
+
+        try:
+            mask_bytes = base64.b64decode(mask_b64, validate=True)
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "Invalid base64 in 'mask_b64'"})
+            return
+
+        img_arr = np.frombuffer(mask_bytes, dtype=np.uint8)
+        img_bgr = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            self._send_json(400, {"ok": False, "error": "Could not decode mask image bytes"})
+            return
+
+        try:
+            real_width_m, real_height_m = load_real_dims_from_payload(dims)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        mask_wall = wall_mask_from_image_rgb(img_rgb)
+        try:
+            wall_bbox_px = wall_bbox_from_mask(mask_wall)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        mpp, _mpp_x, _mpp_y, _px_w, _px_h = derive_isotropic_meters_per_pixel(
+            wall_bbox_px=wall_bbox_px,
+            real_width_m=real_width_m,
+            real_height_m=real_height_m,
+        )
+
+        request_dir_root = os.path.join(repo_root, ".api_tmp")
+        os.makedirs(request_dir_root, exist_ok=True)
+        request_id = uuid.uuid4().hex
+        request_dir = os.path.join(request_dir_root, request_id)
+        os.makedirs(request_dir, exist_ok=True)
+
+        mask_path = os.path.join(request_dir, "mask.png")
+        with open(mask_path, "wb") as f:
+            f.write(mask_bytes)
+
+        out_path = os.path.join(request_dir, "output.dsl")
+        debug_dir = os.path.join(request_dir, "debug")
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "mask2dsl.py"),
+            "--input",
+            os.path.join(".api_tmp", request_id, "mask.png"),
+            "--scale",
+            str(mpp),
+            "--out",
+            os.path.join(".api_tmp", request_id, "output.dsl"),
+            "--debug-dir",
+            os.path.join(".api_tmp", request_id, "debug"),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root, check=False)
+        if completed.returncode != 0:
+            self._send_json(
+                500,
+                {
+                    "ok": False,
+                    "error": "mask2dsl failed",
+                    "stdout": _truncate((completed.stdout or "").strip(), 8000),
+                    "stderr": _truncate((completed.stderr or "").strip(), 8000),
+                },
+            )
+            return
+
+        if not os.path.exists(out_path):
+            self._send_json(500, {"ok": False, "error": "mask2dsl completed but output DSL was not found"})
+            return
+
+        dsl = _read_text_file(out_path, max_chars=max_dsl_chars)
+        if response_format == "json":
+            self._send_json(200, {"ok": True, "meters_per_pixel": mpp, "dsl": dsl})
+        else:
+            self._send_text(200, dsl)
+
+    def _handle_mask2dsl_multipart(self, repo_root: str, content_type: str) -> None:
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+            )
+        except Exception as e:
+            self._send_json(400, {"ok": False, "error": f"Invalid multipart form: {e}"})
+            return
+
+        mask_field = form["mask"] if "mask" in form else (form["image"] if "image" in form else None)
+        if mask_field is None:
+            self._send_json(400, {"ok": False, "error": "Missing file field 'mask' (or 'image')"})
+            return
+        if isinstance(mask_field, list):
+            mask_field = mask_field[0] if mask_field else None
+        if mask_field is None or getattr(mask_field, "file", None) is None:
+            self._send_json(400, {"ok": False, "error": "Missing file field 'mask' (or 'image')"})
+            return
+
+        dims_payload: Optional[Dict[str, Any]] = None
+        dims_field = form["dims"] if "dims" in form else None
+        if isinstance(dims_field, list):
+            dims_field = dims_field[0] if dims_field else None
+
+        # cgi.FieldStorage sets `.file` even for normal text fields; use `.filename` to detect uploads.
+        if dims_field is not None and getattr(dims_field, "filename", None):
+            try:
+                dims_payload = json.loads(dims_field.file.read().decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"ok": False, "error": "Invalid JSON in uploaded 'dims' file"})
+                return
+        else:
+            dims_text = None
+            if dims_field is not None and hasattr(dims_field, "value"):
+                dims_text = dims_field.value
+            if not dims_text:
+                dims_text = form.getfirst("dims") or form.getfirst("realDims") or form.getfirst("real_dims")
+            if dims_text:
+                try:
+                    dims_payload = json.loads(dims_text)
+                except Exception:
+                    self._send_json(400, {"ok": False, "error": "Invalid JSON in 'dims' field"})
+                    return
+
+        if dims_payload is None or not isinstance(dims_payload, dict):
+            self._send_json(400, {"ok": False, "error": "Missing 'dims' JSON (field or file)"})
+            return
+
+        response_format = (form.getfirst("format") or form.getfirst("responseFormat") or "text").lower()
+        max_dsl_chars = int(form.getfirst("maxDslChars") or form.getfirst("max_dsl_chars") or 200000)
+
+        mask_bytes = mask_field.file.read()
+        if not mask_bytes:
+            self._send_json(400, {"ok": False, "error": "Empty mask upload"})
+            return
+
+        import numpy as np
+        import cv2
+
+        img_arr = np.frombuffer(mask_bytes, dtype=np.uint8)
+        img_bgr = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            self._send_json(400, {"ok": False, "error": "Could not decode mask image bytes"})
+            return
+
+        try:
+            real_width_m, real_height_m = load_real_dims_from_payload(dims_payload)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        mask_wall = wall_mask_from_image_rgb(img_rgb)
+        try:
+            wall_bbox_px = wall_bbox_from_mask(mask_wall)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+
+        mpp, _mpp_x, _mpp_y, _px_w, _px_h = derive_isotropic_meters_per_pixel(
+            wall_bbox_px=wall_bbox_px,
+            real_width_m=real_width_m,
+            real_height_m=real_height_m,
+        )
+
+        request_dir_root = os.path.join(repo_root, ".api_tmp")
+        os.makedirs(request_dir_root, exist_ok=True)
+        request_id = uuid.uuid4().hex
+        request_dir = os.path.join(request_dir_root, request_id)
+        os.makedirs(request_dir, exist_ok=True)
+
+        mask_path = os.path.join(request_dir, "mask.png")
+        with open(mask_path, "wb") as f:
+            f.write(mask_bytes)
+
+        out_path = os.path.join(request_dir, "output.dsl")
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "mask2dsl.py"),
+            "--input",
+            os.path.join(".api_tmp", request_id, "mask.png"),
+            "--scale",
+            str(mpp),
+            "--out",
+            os.path.join(".api_tmp", request_id, "output.dsl"),
+            "--debug-dir",
+            os.path.join(".api_tmp", request_id, "debug"),
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root, check=False)
+        if completed.returncode != 0:
+            self._send_json(
+                500,
+                {
+                    "ok": False,
+                    "error": "mask2dsl failed",
+                    "stdout": _truncate((completed.stdout or "").strip(), 8000),
+                    "stderr": _truncate((completed.stderr or "").strip(), 8000),
+                },
+            )
+            return
+
+        if not os.path.exists(out_path):
+            self._send_json(500, {"ok": False, "error": "mask2dsl completed but output DSL was not found"})
+            return
+
+        dsl = _read_text_file(out_path, max_chars=max_dsl_chars)
+        if response_format == "json":
+            self._send_json(200, {"ok": True, "meters_per_pixel": mpp, "dsl": dsl})
         else:
             self._send_text(200, dsl)
 

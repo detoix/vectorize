@@ -95,6 +95,41 @@ def load_real_dims_from_json(path_or_dash: str) -> Tuple[Optional[float], Option
     return real_width_m, real_height_m
 
 
+def load_real_dims_from_payload(payload: object) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Loads real-world dimensions from an in-memory JSON-like object.
+
+    Expected structure (either key may be omitted):
+      {
+        "real-x": {"value": 12.3, "unit": "m"},
+        "real-y": {"value": 8.7,  "unit": "m"}
+      }
+
+    Returns (real_width_m, real_height_m) as floats in meters.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("Real-dimensions payload must be an object at the top level.")
+
+    real_width_m = None
+    real_height_m = None
+
+    if "real-x" in payload and payload["real-x"] is not None:
+        node = payload["real-x"]
+        if not isinstance(node, dict):
+            raise ValueError("'real-x' must be an object with 'value' and 'unit'.")
+        real_width_m = _parse_dimension_to_meters(node.get("value"), node.get("unit"), label="real-x")
+
+    if "real-y" in payload and payload["real-y"] is not None:
+        node = payload["real-y"]
+        if not isinstance(node, dict):
+            raise ValueError("'real-y' must be an object with 'value' and 'unit'.")
+        real_height_m = _parse_dimension_to_meters(node.get("value"), node.get("unit"), label="real-y")
+
+    if real_width_m is None and real_height_m is None:
+        raise ValueError("Payload must include at least one of 'real-x' or 'real-y'.")
+    return real_width_m, real_height_m
+
+
 def derive_isotropic_meters_per_pixel(
     *,
     wall_bbox_px: Tuple[int, int, int, int],

@@ -77,3 +77,27 @@ Supported fields (optional unless noted):
 - `apiKey` / `api_key` (or set `GOOGLE_API_KEY` in the server environment)
 - `format` / `responseFormat` (`text` default, `json` supported)
 - `maxDslChars` / `max_dsl_chars` (truncate returned DSL, default `200000`)
+
+## Mask → DSL (no AI)
+
+`POST /` accepts a 3‑color mask image plus a `dims` JSON payload, derives meters-per-pixel internally, and returns the DSL.
+
+### Multipart form
+
+- File: `mask` (or `image`)
+- Field: `dims` (JSON string) or file field `dims` (JSON file)
+
+```bash
+curl -sS http://127.0.0.1:8000/ \
+  -F "mask=@mask.png" \
+  -F 'dims={"real-x":{"value":860,"unit":"cm"},"real-y":{"value":1070,"unit":"cm"}}'
+```
+
+### JSON
+
+```bash
+b64=$(base64 -w 0 mask.png)
+curl -sS http://127.0.0.1:8000/ \
+  -H 'Content-Type: application/json' \
+  -d "{\"mask_b64\":\"$b64\",\"dims\":{\"real-x\":{\"value\":860,\"unit\":\"cm\"},\"real-y\":{\"value\":1070,\"unit\":\"cm\"}}}"
+```
