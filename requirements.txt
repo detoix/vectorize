@@ -1,6 +1,4 @@
 numpy==2.2.6
 opencv-python-headless==4.12.0.88
 networkx==3.6.1
-scikit-image==0.26.0
-scipy==1.16.3
 shapely==2.1.2

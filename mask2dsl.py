@@ -8,11 +8,198 @@ from typing import List, Tuple, Dict, Optional
 import cv2
 import numpy as np
 import networkx as nx
-from skimage.morphology import skeletonize
+# SAFETY: Preserving original imports for reference/revert capability
+# from skimage.morphology import skeletonize
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import linemerge, substring
-from scipy.spatial import cKDTree
-from scipy.ndimage import map_coordinates
+# SAFETY: Preserving original imports for reference/revert capability
+# from scipy.spatial import cKDTree
+# from scipy.ndimage import map_coordinates
+
+# --- REPLACEMENT ALGORITHMS (Vercel Optimization) ---
+
+def skeletonize_custom(image):
+    """
+    Zhang-Suen thinning algorithm implementation to replace skimage.morphology.skeletonize.
+    Operates on a binary image (0/1 or 0/255). Returns a binary mask (0/1) of the skeleton.
+    """
+    # Ensure image is binary uint8 (0 or 1)
+    img = image.astype(np.uint8)
+    if img.max() > 1:
+        img = (img > 0).astype(np.uint8)
+    
+    # Pre-allocate for speed
+    skel = np.zeros(img.shape, np.uint8)
+    curr = img.copy()
+    
+    # Kernel for neighbor encoding (P2..P9 weights)
+    # P9 P2 P3
+    # P8    P4
+    # P7 P6 P5
+    kernel = np.array([[128, 1, 2], [64, 0, 4], [32, 16, 8]], dtype=np.float32)
+    
+    # Pre-compute LUTs for Zhang-Suen
+    # Note: We can cache this or compute once. Since this function is called once per request, computing is fast enough.
+    lut_s1 = np.array([False]*256)
+    lut_s2 = np.array([False]*256)
+    
+    for i in range(256):
+        # Decode neighbors [P2, P3, ..., P9]
+        # P2=bit0, P3=bit1...
+        neighbors = [(i >> k) & 1 for k in range(8)]
+        # neighbors indices: 0->P2, 1->P3, ... 7->P9
+        
+        # B: Number of non-zero neighbors
+        B = sum(neighbors)
+        if B < 2 or B > 6: continue
+        
+        # A: Number of 0->1 transitions in sequence P2,P3,P4,P5,P6,P7,P8,P9,P2
+        seq = neighbors + [neighbors[0]]
+        A = 0
+        for k in range(8):
+            if seq[k] == 0 and seq[k+1] == 1:
+                A += 1
+        if A != 1: continue
+        
+        P2, P3, P4, P5, P6, P7, P8, P9 = neighbors
+        
+        # Step 1: P2*P4*P6=0 && P4*P6*P8=0
+        if (P2 * P4 * P6 == 0) and (P4 * P6 * P8 == 0):
+            lut_s1[i] = True
+            
+        # Step 2: P2*P4*P8=0 && P2*P6*P8=0
+        if (P2 * P4 * P8 == 0) and (P2 * P6 * P8 == 0):
+            lut_s2[i] = True
+    
+    # Iterative Thinning
+    skel = img.copy()
+    while True:
+        # Step 1
+        neighbors_weighted = cv2.filter2D(skel, cv2.CV_32F, kernel)
+        neighbors_int = neighbors_weighted.astype(np.uint8)
+        
+        # Identify pixels to delete
+        # Since we only care about FG pixels, mask with skel
+        to_check = (skel > 0)
+        should_delete = lut_s1[neighbors_int] & to_check
+        
+        if not np.any(should_delete):
+            break
+            
+        skel[should_delete] = 0
+        
+        # Step 2
+        neighbors_weighted = cv2.filter2D(skel, cv2.CV_32F, kernel)
+        neighbors_int = neighbors_weighted.astype(np.uint8)
+        
+        to_check = (skel > 0)
+        should_delete = lut_s2[neighbors_int] & to_check
+        
+        if not np.any(should_delete):
+            break
+            
+        skel[should_delete] = 0
+
+    return skel
+
+class SimpleKDTree:
+    """
+    Replacement for scipy.spatial.cKDTree.
+    Uses brute-force for small N or simple spatial hashing?
+    For wall endpoints (N < 1000), brute force is likely faster than building a tree in pure Python.
+    """
+    def __init__(self, data):
+        self.data = np.asarray(data)
+
+    def query(self, x, k=1):
+        # x can be a single point or array of points
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x[None, :] # (1, D)
+            return_single = True
+        else:
+            return_single = False
+            
+        # Brute force: dist matrix
+        # data: (N, D), x: (M, D)
+        # diff: (M, N, D) -> uses too much memory if M,N large.
+        # Loop over M is safer.
+        dists = []
+        indices = []
+        
+        for pt in x:
+            # pt: (D,)
+            # d: (N,)
+            diff = self.data - pt
+            d_sq = np.sum(diff**2, axis=1)
+            # Find k smallest
+            if k == 1:
+                idx = np.argmin(d_sq)
+                dists.append(np.sqrt(d_sq[idx]))
+                indices.append(idx)
+            else:
+                # limited support for k>1 if needed
+                part_idx = np.argpartition(d_sq, k)[:k]
+                # sort locally
+                part_d_sq = d_sq[part_idx]
+                sort_order = np.argsort(part_d_sq)
+                final_idx = part_idx[sort_order]
+                final_d = np.sqrt(part_d_sq[sort_order])
+                dists.append(final_d)
+                indices.append(final_idx)
+                
+        if return_single:
+            return dists[0], indices[0]
+        return np.array(dists), np.array(indices)
+        
+    def query_pairs(self, r):
+        """
+        Find all pairs with distance <= r.
+        Returns set of (i, j) with i < j.
+        """
+        # Brute force pairs. (N*(N-1))/2
+        pairs = set()
+        n = len(self.data)
+        r_sq = r * r
+        for i in range(n):
+            for j in range(i + 1, n):
+                d_sq = np.sum((self.data[i] - self.data[j])**2)
+                if d_sq <= r_sq:
+                    pairs.add((i, j))
+        return pairs
+
+def map_coordinates_custom(input_array, coordinates, order=1, mode='constant', cval=0.0):
+    """
+    Replacement for scipy.ndimage.map_coordinates.
+    Supports only order=1 (linear) and simple 2D arrays.
+    coordinates: shape (2, N) -> (y, x)
+    """
+    h, w = input_array.shape[:2]
+    ys = coordinates[0, :]
+    xs = coordinates[1, :]
+    
+    # We can use cv2.remap. 
+    # remap expects maps of shape (H_out, W_out, 1). 
+    # Here we have unstructured points. 
+    # So we construct a 1xN map?
+    
+    map_x = xs.astype(np.float32).reshape(1, -1)
+    map_y = ys.astype(np.float32).reshape(1, -1)
+    
+    # borderMode mapping
+    b_mode = cv2.BORDER_CONSTANT
+    if mode == 'nearest': b_mode = cv2.BORDER_REPLICATE # approx
+    # scipy 'constant' -> cv2 BORDER_CONSTANT
+    
+    # interp
+    interp = cv2.INTER_LINEAR
+    if order == 0: interp = cv2.INTER_NEAREST
+    
+    # cv2.remap(src, map1, map2, interpolation, borderMode, borderValue)
+    out = cv2.remap(input_array, map_x, map_y, interp, borderMode=b_mode, borderValue=cval)
+    # out shape will be (1, N)
+    return out.reshape(-1)
+
 
 def _resample_thickness_from_dist_map(
     walls: List["Wall"],
@@ -60,7 +247,7 @@ def _resample_thickness_from_dist_map(
 
         # Bilinear sample distance transform at subpixel coordinates.
         coords = np.vstack([ys, xs])
-        vals_px = map_coordinates(dist_map, coords, order=1, mode="constant", cval=0.0).astype(np.float32)
+        vals_px = map_coordinates_custom(dist_map, coords, order=1, mode="constant", cval=0.0).astype(np.float32)
 
         valid = vals_px > 1.0
         if not np.any(valid):
@@ -207,8 +394,11 @@ def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
     pt_a_face: Optional[Tuple[int, int]] = None
     pt_b_face: Optional[Tuple[int, int]] = None
     if pts_a.shape[0] > 0 and pts_b.shape[0] > 0:
-        tree_a = cKDTree(pts_a)
-        tree_b = cKDTree(pts_b)
+        # SAFETY: Using custom KDTree for Vercel optimization
+        # tree_a = cKDTree(pts_a)
+        tree_a = SimpleKDTree(pts_a)
+        # tree_b = cKDTree(pts_b)
+        tree_b = SimpleKDTree(pts_b)
 
         dists_a_to_b, _ = tree_b.query(pts_a, k=1)
         dists_b_to_a, _ = tree_a.query(pts_b, k=1)
@@ -537,7 +727,9 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
 def build_skeleton_graph(mask_union, debug_dir, cfg):
     print("Phase 1: Skeletonizing...")
     binary = mask_union > 127
-    skel = skeletonize(binary)
+    # SAFETY: Using custom Zhang-Suen implementation
+    # skel = skeletonize(binary)
+    skel = skeletonize_custom(binary)
     skel_uint8 = (skel * 255).astype(np.uint8)
     if debug_dir: cv2.imwrite(f"{debug_dir}/01_skeleton.png", skel_uint8)
         
@@ -738,7 +930,11 @@ def rebuild_topology(walls, cfg):
     for w in walls: points.extend([w['start'], w['end']])
     if not points: return []
 
-    tree = cKDTree(points)
+    if not points: return []
+
+    # SAFETY: Using custom KDTree for Vercel optimization
+    # tree = cKDTree(points)
+    tree = SimpleKDTree(points)
     pairs = tree.query_pairs(cfg.gravity_snap_axis_snap_tol_px)
     pt_graph = nx.Graph()
     for i in range(len(points)): pt_graph.add_node(i)
