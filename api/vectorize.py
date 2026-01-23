@@ -103,6 +103,7 @@ class handler(BaseHTTPRequestHandler):
 
         mask_bytes: Optional[bytes] = None
         scale: Optional[float] = None
+        response_format: str = "text"  # Default to text/dsl
 
         if content_type.startswith("application/json"):
             try:
@@ -114,6 +115,8 @@ class handler(BaseHTTPRequestHandler):
                 scale = float(payload.get("scale"))
             except (TypeError, ValueError):
                 return _send_json(self, 400, {"ok": False, "error": "Missing/invalid 'scale' (number)"})
+            
+            response_format = payload.get("format", "text")
 
             mask_b64 = payload.get("mask_b64")
             if not isinstance(mask_b64, str) or not mask_b64.strip():
@@ -139,6 +142,8 @@ class handler(BaseHTTPRequestHandler):
                 scale = float(fields.get("scale", ""))
             except ValueError:
                 return _send_json(self, 400, {"ok": False, "error": "Missing/invalid multipart field 'scale'"})
+            
+            response_format = fields.get("format", "text")
         else:
             return _send_json(
                 self,
@@ -176,6 +181,9 @@ class handler(BaseHTTPRequestHandler):
                     "--debug-dir",
                     os.path.join(tmpdir, "debug"),
                 ]
+                
+                if response_format == "json":
+                    cmd.extend(["--format", "json"])
 
                 completed = subprocess.run(
                     cmd,
@@ -202,5 +210,17 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return _send_json(self, 500, {"ok": False, "error": f"Server error: {e.__class__.__name__}: {e}"})
 
+        if response_format == "json":
+             # mask2dsl.py already wrote a JSON string to `dsl`
+            try:
+                # We interpret it as JSON to ensure validity before sending? 
+                # Or just send it as a raw string if we want to avoid double-parsing cost?
+                # Better to parse and send as object so HTTP Content-Type application/json is correct
+                # and client receives an actual object, not a stringified JSON.
+                json_output = json.loads(dsl)
+                return _send_json(self, 200, {"ok": True, "result": json_output})
+            except json.JSONDecodeError:
+                return _send_json(self, 500, {"ok": False, "error": "Internal error: mask2dsl produced invalid JSON"})
+        
         return _send_text(self, 200, dsl)
 

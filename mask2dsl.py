@@ -1600,6 +1600,43 @@ def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
             )
     return "\n".join(lines)
 
+def emit_json(walls: List[Wall], openings: List[Opening], cfg: Config) -> str:
+    import json
+    from dataclasses import asdict
+    
+    # Sort for deterministic output
+    walls.sort(key=lambda x: x.id)
+    openings.sort(key=lambda x: (x.wall_id, x.at))
+    
+    # Clean up Wall objects for JSON (remove internal fields like thickness_samples, px_geom)
+    walls_clean = []
+    for w in walls:
+        w_dict = asdict(w)
+        # Remove non-serializable or internal fields
+        if "px_geom" in w_dict: del w_dict["px_geom"]
+        if "thickness_samples" in w_dict: del w_dict["thickness_samples"]
+        # Round floats
+        w_dict["start"] = (round(w.start[0], 3), round(w.start[1], 3))
+        w_dict["end"] = (round(w.end[0], 3), round(w.end[1], 3))
+        w_dict["thickness"] = round(w.thickness, 2)
+        w_dict["axis_offset"] = round(w.axis_offset, 3)
+        walls_clean.append(w_dict)
+        
+    openings_clean = []
+    for o in openings:
+        o_dict = asdict(o)
+        if "px_center" in o_dict: del o_dict["px_center"]
+        o_dict["at"] = round(o.at, 3)
+        o_dict["width"] = round(o.width, 3)
+        openings_clean.append(o_dict)
+        
+    output = {
+        "level": {"name": "L1", "elev": 0},
+        "walls": walls_clean,
+        "openings": openings_clean,
+    }
+    return json.dumps(output, indent=2)
+
 def build_walls_from_masks(mask_union, dist_map, dims, cfg: Config, debug_dir: Optional[str]):
     skel_graph = build_skeleton_graph(mask_union, debug_dir, cfg)
     raw_vectors = graph_to_vectors(skel_graph, debug_dir, cfg)
@@ -1714,6 +1751,12 @@ def main():
         default=0.02,
         help="Meters-per-pixel scale for converting pixels to meters.",
     )
+    parser.add_argument(
+        "--format",
+        choices=["dsl", "json"],
+        default="dsl",
+        help="Output format: 'dsl' (default) or 'json'.",
+    )
     args = parser.parse_args()
     
     cfg = Config(meters_per_pixel=args.scale)
@@ -1746,7 +1789,10 @@ def main():
     openings = extract_openings(mask_open, mask_wall, walls_merged, cfg)
     
     with open(args.out, "w") as f:
-        f.write(emit_dsl(walls_merged, openings, cfg))
+        if args.format == "json":
+            f.write(emit_json(walls_merged, openings, cfg))
+        else:
+            f.write(emit_dsl(walls_merged, openings, cfg))
     print(f"Done! Written to {args.out}")
 
     if args.debug_dir:
