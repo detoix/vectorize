@@ -280,33 +280,53 @@ class Config:
     meters_per_pixel: float = 0.02
     wall_height: float = 2.7
     default_thickness: float = 0.20 # Used if sampling fails
-    gravity_snap_axis_snap_tol_px: float = 10.0  # Phase 3: axis snapping radius (pixels)
-    consolidate_axis_cluster_tol_m: float = 0.15  # Phase 5.5: axis clustering tolerance (meters)
-    collinear_tol_deg: float = 15.0 # Tolerance for merging lines (180 +/- 5)
-    ortho_tol_deg: float = 15.0     # Tolerance for forcing 0/90 degrees
-    min_spur_length_px: int = 10   # Prune skeletal dead ends
-    spur_alignment_power: float = 2.0  # >1 increases pruning bias against diagonals
-    extension_max_px: int = 10 # Max pixels to extend skeleton ends
-    axis_offset_min_m: float = 0.06  # Ignore tiny axis offsets (<2cm)
-    axis_offset_min_overlap_m: float = 0.10  # Baseline overlap required (meters)
-    axis_offset_sigma_m: float = 0.10  # Soft weighting length scale for axis matching (meters)
-    orthogonal_junction_snap_m: float = 0.2  # Max endpoint shift to meet perpendicular wall (meters)
-    opening_bridge_px: int = 3     # Dilation size for Blue Bridge
-    epsilon_rdp: float = 3.0       # RDP simplification epsilon
-
+    
+    # Tolerances & Thresholds (Meters)
+    gravity_snap_axis_snap_tol_m: float = 0.20
+    consolidate_axis_cluster_tol_m: float = 0.15
+    collinear_tol_deg: float = 15.0 
+    ortho_tol_deg: float = 15.0     
+    
+    min_spur_length_m: float = 0.20
+    spur_alignment_power: float = 2.0 
+    extension_max_m: float = 0.20
+    
+    axis_offset_min_m: float = 0.06 
+    axis_offset_min_overlap_m: float = 0.10
+    axis_offset_sigma_m: float = 0.10 
+    orthogonal_junction_snap_m: float = 0.2
+    
+    opening_bridge_m: float = 0.06
+    epsilon_rdp_m: float = 0.06
+    
     long_opening_m: float = 2.5
     door_circularity_thresh: float = 0.25
     door_swing_perp_factor: float = 1.5
-    door_swing_perp_min_px: float = 8.0
+    door_swing_perp_min_m: float = 0.16
+    
     default_door_height_m: float = 2.1
     default_window_height_m: float = 1.2
     default_window_sill_m: float = 0.9
-    opening_wall_max_dist_m: float = 1.2  # Max centroid-to-wall distance for assigning an opening
-    opening_search_dilate_px: int = 15
+    
+    opening_wall_max_dist_m: float = 1.2
+    opening_search_dilate_m: float = 0.30
     corner_gap_deviation_deg: float = 30.0
-    opening_active_face_eps_px: float = 4.0
+    opening_active_face_eps_m: float = 0.08
     opening_active_face_max_pts: int = 5000
     thickness_rounding_m: float = 0.01
+
+    # Extracted Hardcoded Values (Meters)
+    corner_cut_min_len_m: float = 0.24
+    corner_cut_max_len_m: float = 5.0
+    min_opening_area_sq_m: float = 0.004 # ~10px at 0.02
+    
+    t_junction_split_tol_m: float = 0.2
+    t_junction_end_margin_m: float = 0.2
+    t_junction_min_seg_len_m: float = 0.05
+    
+    merge_thickness_tol_m: float = 0.05
+    merge_collinear_dist_m: float = 0.1
+    merge_near_joint_dist_m: float = 0.2
 
 # --- DATA STRUCTURES ---
 @dataclass
@@ -341,9 +361,10 @@ def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
     """
     single_mask = np.zeros_like(mask_wall)
     cv2.drawContours(single_mask, [cnt], -1, 255, -1)
+    search_zone_px = int(round(cfg.opening_search_dilate_m / cfg.meters_per_pixel))
     search_zone = cv2.dilate(
         single_mask,
-        np.ones((cfg.opening_search_dilate_px, cfg.opening_search_dilate_px), np.uint8),
+        np.ones((search_zone_px, search_zone_px), np.uint8),
     )
     nearby_walls = cv2.bitwise_and(mask_wall, search_zone)
 
@@ -405,7 +426,7 @@ def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
         dists_b_to_a, _ = tree_a.query(pts_b, k=1)
         d_min = float(min(float(np.min(dists_a_to_b)), float(np.min(dists_b_to_a))))
 
-        eps = float(cfg.opening_active_face_eps_px)
+        eps = float(cfg.opening_active_face_eps_m / cfg.meters_per_pixel)
         active_a = pts_a[dists_a_to_b <= d_min + eps]
         active_b = pts_b[dists_b_to_a <= d_min + eps]
 
@@ -517,6 +538,7 @@ def cut_corner_opening_in_mask(
     intersection: Tuple[int, int],
     pt_a: Tuple[int, int],
     pt_b: Tuple[int, int],
+    cfg: Config
 ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
     """
     Draw a 45-degree cut line through `intersection` to split a single corner-opening blob into 2.
@@ -531,7 +553,9 @@ def cut_corner_opening_in_mask(
     min_dim = float(min(rect_w_px, rect_h_px))
 
     # Long enough to traverse the opening blob, plus a little margin.
-    half_len = int(round(max(12.0, min(250.0, 0.9 * max_dim))))
+    min_len_px = cfg.corner_cut_min_len_m / cfg.meters_per_pixel
+    max_len_px = cfg.corner_cut_max_len_m / cfg.meters_per_pixel
+    half_len = int(round(max(min_len_px, min(max_len_px, 0.9 * max_dim))))
 
     def signed_side(normal: Tuple[int, int], p: Tuple[int, int]) -> float:
         return float((p[0] - ix) * normal[0] + (p[1] - iy) * normal[1])
@@ -584,8 +608,9 @@ def split_corner_openings_in_mask(mask_open: np.ndarray, mask_wall: np.ndarray, 
     if debug_dir:
         debug_img = cv2.cvtColor(mask_out, cv2.COLOR_GRAY2BGR)
 
+    min_area_px = cfg.min_opening_area_sq_m / (cfg.meters_per_pixel ** 2)
     for cnt in contours:
-        if cv2.contourArea(cnt) < 10:
+        if cv2.contourArea(cnt) < min_area_px:
             continue
 
         ctx = get_opening_jamb_context(cnt, mask_wall, cfg)
@@ -612,7 +637,7 @@ def split_corner_openings_in_mask(mask_open: np.ndarray, mask_wall: np.ndarray, 
         if not intersection:
             continue
 
-        p1, p2 = cut_corner_opening_in_mask(mask_out, cnt, intersection, pt_a_centroid, pt_b_centroid)
+        p1, p2 = cut_corner_opening_in_mask(mask_out, cnt, intersection, pt_a_centroid, pt_b_centroid, cfg)
         if debug_img is not None:
             cv2.circle(debug_img, intersection, 3, (255, 0, 0), -1)
             cv2.line(debug_img, p1, p2, (0, 255, 255), 2, lineType=cv2.LINE_8)
@@ -632,8 +657,9 @@ def create_robust_union_mask(mask_wall, mask_open, debug_dir, cfg: Config):
     
     contours, _ = cv2.findContours(mask_open, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
+    min_area_px = cfg.min_opening_area_sq_m / (cfg.meters_per_pixel ** 2)
     for i, cnt in enumerate(contours):
-        if cv2.contourArea(cnt) < 10: continue
+        if cv2.contourArea(cnt) < min_area_px: continue
 
         ctx = get_opening_jamb_context(cnt, mask_wall, cfg)
         if ctx is None:
@@ -699,7 +725,8 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask_open_raw = cv2.morphologyEx(mask_open_raw, cv2.MORPH_CLOSE, kernel_clean)
     
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (cfg.opening_bridge_px, cfg.opening_bridge_px))
+    bridge_px = int(round(cfg.opening_bridge_m / cfg.meters_per_pixel))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_px, bridge_px))
     mask_open_dilated = cv2.dilate(mask_open_raw, kernel, iterations=1)
     
     mask_union = create_robust_union_mask(mask_wall, mask_open_dilated, debug_dir, cfg)
@@ -792,7 +819,7 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
         curr_x, curr_y = float(end_node[0]), float(end_node[1])
         
         extended_pixels = []
-        max_dist = float(cfg.extension_max_px)
+        max_dist = float(cfg.extension_max_m / cfg.meters_per_pixel)
         dist_accum = 0.0
         
         while dist_accum < max_dist:
@@ -863,11 +890,12 @@ def build_skeleton_graph(mask_union, debug_dir, cfg):
                 effective_length = length * (alignment ** float(cfg.spur_alignment_power))
                 
                 # Check if we hit a true junction (degree > 2) OR if path is too long
-                if G.degree(curr) > 2 or (effective_length + 1e-9) >= float(cfg.min_spur_length_px):
+                min_spur_len_px = float(cfg.min_spur_length_m / cfg.meters_per_pixel)
+                if G.degree(curr) > 2 or (effective_length + 1e-9) >= min_spur_len_px:
                     break
 
             # If meaningful spur attached to a junction
-            if (effective_length + 1e-9) < float(cfg.min_spur_length_px) and G.degree(curr) >= 3:
+            if (effective_length + 1e-9) < min_spur_len_px and G.degree(curr) >= 3:
                 junction_spurs[curr].append({
                     'tip': start,
                     'path': path, # distinct nodes from tip to junction (curr is last, not pruned)
@@ -930,7 +958,8 @@ def graph_to_vectors(G, debug_dir, cfg):
                 if curr in key_nodes: break
             
             line = LineString(path)
-            simplified = line.simplify(cfg.epsilon_rdp, preserve_topology=True)
+            epsilon_px = cfg.epsilon_rdp_m / cfg.meters_per_pixel
+            simplified = line.simplify(epsilon_px, preserve_topology=True)
             if simplified.length > 2:
                 if simplified.geom_type == 'MultiLineString':
                     for g in simplified.geoms: vectors.append(g)
@@ -973,8 +1002,9 @@ def gravity_snap(vectors, debug_dir, cfg):
     for w in h_walls:
         y = w['start'][1]
         snapped = False
+        snap_tol_px = cfg.gravity_snap_axis_snap_tol_m / cfg.meters_per_pixel
         for axis in axes_y:
-            if abs(axis['val'] - y) < cfg.gravity_snap_axis_snap_tol_px:
+            if abs(axis['val'] - y) < snap_tol_px:
                 w['start'][1] = axis['val']; w['end'][1] = axis['val']; snapped = True; break
         if not snapped: axes_y.append({'val': y})
 
@@ -985,8 +1015,9 @@ def gravity_snap(vectors, debug_dir, cfg):
     for w in v_walls:
         x = w['start'][0]
         snapped = False
+        snap_tol_px = cfg.gravity_snap_axis_snap_tol_m / cfg.meters_per_pixel
         for axis in axes_x:
-            if abs(axis['val'] - x) < cfg.gravity_snap_axis_snap_tol_px:
+            if abs(axis['val'] - x) < snap_tol_px:
                 w['start'][0] = axis['val']; w['end'][0] = axis['val']; snapped = True; break
         if not snapped: axes_x.append({'val': x})
 
@@ -1012,7 +1043,8 @@ def rebuild_topology(walls, cfg):
     # SAFETY: Using custom KDTree for Vercel optimization
     # tree = cKDTree(points)
     tree = SimpleKDTree(points)
-    pairs = tree.query_pairs(cfg.gravity_snap_axis_snap_tol_px)
+    snap_tol_px = cfg.gravity_snap_axis_snap_tol_m / cfg.meters_per_pixel
+    pairs = tree.query_pairs(snap_tol_px)
     pt_graph = nx.Graph()
     for i in range(len(points)): pt_graph.add_node(i)
     pt_graph.add_edges_from(list(pairs))
@@ -1244,7 +1276,7 @@ def consolidate_walls(walls: List[Wall], cfg):
             
             # 1. Thickness match?
             # Allow merging if thickness is very close
-            same_thick = abs(current.thickness - next_w.thickness) < 0.05
+            same_thick = abs(current.thickness - next_w.thickness) < cfg.merge_thickness_tol_m
             
             # Check T-Junction: Look for any OTHER wall near the join point
             # Ignore very short walls (<0.5m) as they are likely artifacts
@@ -1275,13 +1307,13 @@ def consolidate_walls(walls: List[Wall], cfg):
                 
                 if curr_is_vert == is_w2_vert:
                     if curr_is_vert:
-                        if abs(current.start[0] - check_w.start[0]) < 0.1: continue
+                        if abs(current.start[0] - check_w.start[0]) < cfg.merge_collinear_dist_m: continue
                     else:
-                        if abs(current.start[1] - check_w.start[1]) < 0.1: continue
+                        if abs(current.start[1] - check_w.start[1]) < cfg.merge_collinear_dist_m: continue
 
                 d_s = math.hypot(check_w.start[0]-join_pt[0], check_w.start[1]-join_pt[1])
                 d_e = math.hypot(check_w.end[0]-join_pt[0], check_w.end[1]-join_pt[1])
-                if d_s < 0.2 or d_e < 0.2: 
+                if d_s < cfg.merge_near_joint_dist_m or d_e < cfg.merge_near_joint_dist_m: 
                     num_near += 1
             
             if num_near > 0: is_simple_joint = False
@@ -1289,7 +1321,7 @@ def consolidate_walls(walls: List[Wall], cfg):
             # Thickness policy:
             # For collinear segments we merge whenever geometry/topology allows, and keep the thicker value.
             # This treats thickness differences as sampling noise (or conservative "max thickness wins").
-            if gap < 0.2 and is_simple_joint:
+            if gap < cfg.merge_near_joint_dist_m and is_simple_joint:
                 # Merge
                 current.thickness = max(current.thickness, next_w.thickness)
                 if next_w.thickness_samples:
@@ -1371,9 +1403,9 @@ def consolidate_walls(walls: List[Wall], cfg):
         Split a wall when an endpoint of a perpendicular wall lands on its interior.
         This prevents long merged runs (e.g., a long top wall) from spanning across a T-junction.
         """
-        tol = 0.2        # endpoint must be within 20cm of the wall centerline
-        end_margin = 0.2 # don't split within 20cm of the wall endpoints
-        min_seg_len = 0.05
+        split_tol = cfg.t_junction_split_tol_m
+        end_margin = cfg.t_junction_end_margin_m
+        min_seg_len = cfg.t_junction_min_seg_len_m
 
         result: List[Wall] = []
         for w in walls_in:
@@ -1386,9 +1418,9 @@ def consolidate_walls(walls: List[Wall], cfg):
                     if other is w or is_horizontal(other):
                         continue
                     for pt in (other.start, other.end):
-                        if abs(pt[1] - y) > tol:
+                        if abs(pt[1] - y) > split_tol:
                             continue
-                        if pt[0] < x0 - tol or pt[0] > x1 + tol:
+                        if pt[0] < x0 - split_tol or pt[0] > x1 + split_tol:
                             continue
                         if (x0 + end_margin) < pt[0] < (x1 - end_margin):
                             split_xs.add(pt[0])
@@ -1420,9 +1452,9 @@ def consolidate_walls(walls: List[Wall], cfg):
                     if other is w or not is_horizontal(other):
                         continue
                     for pt in (other.start, other.end):
-                        if abs(pt[0] - x) > tol:
+                        if abs(pt[0] - x) > split_tol:
                             continue
-                        if pt[1] < y0 - tol or pt[1] > y1 + tol:
+                        if pt[1] < y0 - split_tol or pt[1] > y1 + split_tol:
                             continue
                         if (y0 + end_margin) < pt[1] < (y1 - end_margin):
                             split_ys.add(pt[1])
@@ -1537,8 +1569,9 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
     contours, _ = cv2.findContours(mask_open, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     openings = []
     
+    min_area_px = cfg.min_opening_area_sq_m / (cfg.meters_per_pixel ** 2)
     for i, cnt in enumerate(contours):
-        if cv2.contourArea(cnt) < 10: continue
+        if cv2.contourArea(cnt) < min_area_px: continue
         M = cv2.moments(cnt)
         if M["m00"] == 0: continue
         cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
@@ -1606,7 +1639,7 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
 
         wall_thickness_m = best_wall.thickness if best_wall.thickness > 0 else cfg.default_thickness
         wall_thickness_px = wall_thickness_m / cfg.meters_per_pixel
-        swing_thresh_px = max(cfg.door_swing_perp_min_px, cfg.door_swing_perp_factor * wall_thickness_px)
+        swing_thresh_px = max(cfg.door_swing_perp_min_m / cfg.meters_per_pixel, cfg.door_swing_perp_factor * wall_thickness_px)
         door_by_swing = max_perp_px >= swing_thresh_px
 
         if door_by_swing:
@@ -1757,7 +1790,7 @@ def compute_axis_offset_from_baseline(
 
     # Allow matching up to the snap radius (in meters) plus a small buffer.
     axis_match_tol_m = max(
-        float(cfg.gravity_snap_axis_snap_tol_px) * float(cfg.meters_per_pixel) + 0.05,
+        float(cfg.gravity_snap_axis_snap_tol_m / cfg.meters_per_pixel) * float(cfg.meters_per_pixel) + 0.05,
         0.25,
     )
 
@@ -1926,7 +1959,7 @@ def main():
     # Two-pass axis offset:
     baseline_cfg = replace(
         cfg,
-        gravity_snap_axis_snap_tol_px=0.0,
+        gravity_snap_axis_snap_tol_m=0.0,
         consolidate_axis_cluster_tol_m=0.0,
     )
     baseline_walls = build_walls_from_masks(mask_union, dist_map, dims, baseline_cfg, debug_dir=None)
