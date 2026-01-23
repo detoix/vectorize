@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/vectorize.py": {
+      "maxDuration": 60
+    }
+  }
+}
+

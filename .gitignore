@@ -12,4 +12,5 @@ venv/
 *.png
 debug/
 debug_test/
+debug_pipeline*/
 .api_tmp/
