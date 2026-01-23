@@ -103,6 +103,8 @@ class handler(BaseHTTPRequestHandler):
 
         mask_bytes: Optional[bytes] = None
         scale: Optional[float] = None
+        real_x: Optional[Dict[str, object]] = None
+        real_y: Optional[Dict[str, object]] = None
         response_format: str = "text"  # Default to text/dsl
 
         if content_type.startswith("application/json"):
@@ -112,9 +114,13 @@ class handler(BaseHTTPRequestHandler):
                 return _send_json(self, 400, {"ok": False, "error": "Invalid JSON"})
 
             try:
-                scale = float(payload.get("scale"))
+                if "scale" in payload:
+                    scale = float(payload.get("scale"))
             except (TypeError, ValueError):
-                return _send_json(self, 400, {"ok": False, "error": "Missing/invalid 'scale' (number)"})
+                return _send_json(self, 400, {"ok": False, "error": "Invalid 'scale' (number)"})
+            
+            real_x = payload.get("real-x")
+            real_y = payload.get("real-y")
             
             response_format = payload.get("format", "text")
 
@@ -138,11 +144,26 @@ class handler(BaseHTTPRequestHandler):
                 return _send_json(self, 400, {"ok": False, "error": "Missing multipart file field 'mask'"})
             mask_bytes = files["mask"]
 
-            try:
-                scale = float(fields.get("scale", ""))
-            except ValueError:
-                return _send_json(self, 400, {"ok": False, "error": "Missing/invalid multipart field 'scale'"})
+            # Try to get scale (legacy)
+            val = fields.get("scale", "").strip()
+            if val:
+                try:
+                    scale = float(val)
+                except ValueError:
+                    return _send_json(self, 400, {"ok": False, "error": "Invalid multipart field 'scale'"})
             
+            # Try to get real-x / real-y (expecting JSON strings in these fields)
+            if "real-x" in fields:
+                try:
+                    real_x = json.loads(fields["real-x"])
+                except json.JSONDecodeError:
+                    return _send_json(self, 400, {"ok": False, "error": "Invalid JSON in field 'real-x'"})
+            if "real-y" in fields:
+                try:
+                    real_y = json.loads(fields["real-y"])
+                except json.JSONDecodeError:
+                     return _send_json(self, 400, {"ok": False, "error": "Invalid JSON in field 'real-y'"})
+
             response_format = fields.get("format", "text")
         else:
             return _send_json(
@@ -151,8 +172,7 @@ class handler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "Unsupported Content-Type (use application/json or multipart/form-data)"},
             )
 
-        if scale is None or not (scale > 0):
-            return _send_json(self, 400, {"ok": False, "error": "'scale' must be > 0"})
+        # Validation moved to command construction to allow mutually exclusive logic
         if mask_bytes is None or len(mask_bytes) < 8:
             return _send_json(self, 400, {"ok": False, "error": "Missing/invalid mask image bytes"})
 
@@ -174,13 +194,33 @@ class handler(BaseHTTPRequestHandler):
                     mask2dsl_path,
                     "--input",
                     mask_path,
-                    "--scale",
-                    str(scale),
                     "--out",
                     out_path,
                     "--debug-dir",
                     os.path.join(tmpdir, "debug"),
                 ]
+                
+                # Logic: prefer real-json if available, else scale.
+                dims_payload = {}
+                if real_x is not None:
+                     dims_payload["real-x"] = real_x
+                if real_y is not None:
+                     dims_payload["real-y"] = real_y
+                
+                if dims_payload:
+                    dims_json_path = os.path.join(tmpdir, "dims.json")
+                    with open(dims_json_path, "w") as f:
+                        json.dump(dims_payload, f)
+                    cmd.extend(["--real-json", dims_json_path])
+                    
+                    # Pass a dummy scale if script insists on having one or logic requires it?
+                    # mask2dsl default is 0.02, but if we pass --real-json it overrides logic.
+                    # We might still want to pass a dummy scale to keep argparse happy if it was required?
+                    # It's not required in argparse (default=0.02).
+                else:
+                    if scale is None or not (scale > 0):
+                        return _send_json(self, 400, {"ok": False, "error": "Missing scale or real dimensions"})
+                    cmd.extend(["--scale", str(scale)])
                 
                 if response_format == "json":
                     cmd.extend(["--format", "json"])

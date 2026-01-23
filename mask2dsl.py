@@ -1757,17 +1757,96 @@ def main():
         default="dsl",
         help="Output format: 'dsl' (default) or 'json'.",
     )
+    parser.add_argument(
+        "--real-json",
+        default=None,
+        help="Path to JSON file with real dimensions ('real-x', 'real-y'). Overrides --scale.",
+    )
     args = parser.parse_args()
     
-    cfg = Config(meters_per_pixel=args.scale)
-    if args.debug_dir:
-        os.makedirs(args.debug_dir, exist_ok=True)
-        
-    mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
+    # Scale resolution
+    scale = args.scale
+    if args.real_json:
+        # Import here to avoid circular dependencies if any, though likely safe at top
+        from extract_scale import (
+            load_real_dims_from_json,
+            derive_isotropic_meters_per_pixel,
+        )
 
+        try:
+            real_width_m, real_height_m = load_real_dims_from_json(args.real_json)
+            
+            # We need image dimensions to compute scale. 
+            # load_and_preprocess returns (mask_union, mask_wall, mask_open, dist_map, dims)
+            # but we need it *before* Config init? 
+            # Actually Config needs meters_per_pixel. 
+            # But load_and_preprocess needs Config.
+            # Catch-22?
+            # 
+            # Let's look at load_and_preprocess.
+            # It calls create_robust_union_mask -> get_opening_jamb_context -> (uses cfg.opening_search_dilate_px etc).
+            # It uses cfg.opening_bridge_px.
+            # These are PIXEL values.
+            # 
+            # Does load_and_preprocess use meters_per_pixel?
+            # It scans dist_map but ... wait.
+            # 
+            # _resample_thickness_from_dist_map uses cfg.meters_per_pixel.
+            # build_walls_from_masks uses cfg.
+            # 
+            # load_and_preprocess itself only uses cfg for pixel-based kernels (opening_bridge_px).
+            # It DOES NOT look like it uses meters_per_pixel.
+            # So we can run load_and_preprocess with a dummy scale (or args.scale), 
+            # THEN compute the real scale, update cfg, and proceed.
+            
+            # Initial load with default/CLI scale (might be ignored later)
+            cfg_initial = Config(meters_per_pixel=scale)
+            if args.debug_dir:
+                os.makedirs(args.debug_dir, exist_ok=True)
+                
+            mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg_initial)
+            
+            h, w = dims
+            # wall_bbox_px is needed for derive_isotropic_meters_per_pixel.
+            # extract_scale uses wall_mask_from_image_rgb -> wall_bbox_from_mask.
+            # load_and_preprocess returns mask_wall, we can use that.
+            
+            ys, xs = np.nonzero(mask_wall > 0)
+            if len(xs) > 0 and len(ys) > 0:
+                wall_bbox_px = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+                
+                mpp, _, _, _, _ = derive_isotropic_meters_per_pixel(
+                    wall_bbox_px=wall_bbox_px,
+                    real_width_m=real_width_m,
+                    real_height_m=real_height_m,
+                )
+                scale = mpp
+                print(f"Computed scale from real dims: {scale:.6f} m/px")
+            else:
+                print("Warning: No wall pixels found, cannot compute scale from real dims. Using default.")
+
+        except Exception as e:
+            print(f"Error computing scale from real dims: {e}. Falling back to --scale {scale}")
+            # Fallback or error? Implementation plan implies we should use real dims if present.
+            # If explicit JSON is provided but fails, we should probably fail hard or warn.
+            # For now, print error and proceed with fallback to avoid total crash?
+            # Actually, better to raise if user explicitly asked for it. 
+            # But let's stick to the prompt's preference for robustness? 
+            # "If real_x... are provided, they take precedence"
+            raise e
+
+    cfg = Config(meters_per_pixel=scale)
+    
+    # If we didn't run load_and_preprocess yet (no real_json), run it now.
+    # If we DID run it, we already have the masks.
+    if not args.real_json:
+        if args.debug_dir:
+            os.makedirs(args.debug_dir, exist_ok=True)
+        mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
+
+    # Rest of the pipeline matches main...
+    
     # Two-pass axis offset:
-    # - baseline run turns off Phase 3 axis snapping and Phase 5.5 axis clustering to avoid implicit alignment
-    # - snapped run uses cfg.gravity_snap_axis_snap_tol_px and cfg.consolidate_axis_cluster_tol_m
     baseline_cfg = replace(
         cfg,
         gravity_snap_axis_snap_tol_px=0.0,
