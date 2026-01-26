@@ -1710,7 +1710,7 @@ def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
             )
     return "\n".join(lines)
 
-def emit_json(walls: List[Wall], openings: List[Opening], cfg: Config) -> str:
+def emit_json(walls: List[Wall], openings: List[Opening], canvas_dims: Tuple[float, float]) -> str:
     import json
     
     # Sort for deterministic output
@@ -1742,6 +1742,10 @@ def emit_json(walls: List[Wall], openings: List[Opening], cfg: Config) -> str:
         })
         
     output = {
+        "canvas": {
+            "width": round(canvas_dims[0], 3),
+            "height": round(canvas_dims[1], 3)
+        },
         "walls": walls_output
     }
     return json.dumps(output, indent=2)
@@ -1978,7 +1982,10 @@ def main():
     
     with open(args.out, "w") as f:
         if args.format == "json":
-            f.write(emit_json(walls_merged, openings, cfg))
+            h_px, w_px = dims
+            canvas_width_m = w_px * scale
+            canvas_height_m = h_px * scale
+            f.write(emit_json(walls_merged, openings, (canvas_width_m, canvas_height_m)))
         else:
             f.write(emit_dsl(walls_merged, openings, cfg))
     print(f"Done! Written to {args.out}")
