@@ -1644,17 +1644,13 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
 
         if door_by_swing:
             opening_type = "door"
+            sill_m = 0.0
         elif width_m >= cfg.long_opening_m:
-            opening_type = "door"
+            opening_type = "window"
+            sill_m = 0.0
         else:
             opening_type = "window"
-
-        if opening_type == "window":
-            height_m = cfg.default_window_height_m
             sill_m = cfg.default_window_sill_m
-        else:
-            height_m = cfg.default_door_height_m
-            sill_m = 0.0
 
         # Project centroid to wall axis, then convert to "edge closest to wall.start".
         w_line = LineString([best_wall.start, best_wall.end])
@@ -1730,7 +1726,8 @@ def emit_json(walls: List[Wall], openings: List[Opening], canvas_dims: Tuple[flo
                 "id": o.id,
                 "type": o.type,
                 "t": round(o.at, 3),
-                "width": round(o.width, 3)
+                "width": round(o.width, 3),
+                "z": round(o.sill, 3)
             })
             
         walls_output.append({
@@ -1738,6 +1735,7 @@ def emit_json(walls: List[Wall], openings: List[Opening], canvas_dims: Tuple[flo
             "start": {"x": round(w.start[0], 3), "y": round(w.start[1], 3)},
             "end": {"x": round(w.end[0], 3), "y": round(w.end[1], 3)},
             "thickness": round(w.thickness, 2),
+            "axisOffset": round(w.axis_offset, 3),
             "openings": w_openings
         })
         
