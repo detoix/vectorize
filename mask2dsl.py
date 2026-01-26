@@ -1712,38 +1712,37 @@ def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
 
 def emit_json(walls: List[Wall], openings: List[Opening], cfg: Config) -> str:
     import json
-    from dataclasses import asdict
     
     # Sort for deterministic output
     walls.sort(key=lambda x: x.id)
     openings.sort(key=lambda x: (x.wall_id, x.at))
     
-    # Clean up Wall objects for JSON (remove internal fields like thickness_samples, px_geom)
-    walls_clean = []
-    for w in walls:
-        w_dict = asdict(w)
-        # Remove non-serializable or internal fields
-        if "px_geom" in w_dict: del w_dict["px_geom"]
-        if "thickness_samples" in w_dict: del w_dict["thickness_samples"]
-        # Round floats
-        w_dict["start"] = (round(w.start[0], 3), round(w.start[1], 3))
-        w_dict["end"] = (round(w.end[0], 3), round(w.end[1], 3))
-        w_dict["thickness"] = round(w.thickness, 2)
-        w_dict["axis_offset"] = round(w.axis_offset, 3)
-        walls_clean.append(w_dict)
-        
-    openings_clean = []
+    # Group openings by wall_id
+    openings_by_wall = defaultdict(list)
     for o in openings:
-        o_dict = asdict(o)
-        if "px_center" in o_dict: del o_dict["px_center"]
-        o_dict["at"] = round(o.at, 3)
-        o_dict["width"] = round(o.width, 3)
-        openings_clean.append(o_dict)
+        openings_by_wall[o.wall_id].append(o)
+        
+    walls_output = []
+    for w in walls:
+        w_openings = []
+        for o in openings_by_wall[w.id]:
+            w_openings.append({
+                "id": o.id,
+                "type": o.type,
+                "t": round(o.at, 3),
+                "width": round(o.width, 3)
+            })
+            
+        walls_output.append({
+            "id": w.id,
+            "start": {"x": round(w.start[0], 3), "y": round(w.start[1], 3)},
+            "end": {"x": round(w.end[0], 3), "y": round(w.end[1], 3)},
+            "thickness": round(w.thickness, 2),
+            "openings": w_openings
+        })
         
     output = {
-        "level": {"name": "L1", "elev": 0},
-        "walls": walls_clean,
-        "openings": openings_clean,
+        "walls": walls_output
     }
     return json.dumps(output, indent=2)
 
