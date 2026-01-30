@@ -319,6 +319,7 @@ class Config:
     corner_cut_min_len_m: float = 0.24
     corner_cut_max_len_m: float = 5.0
     min_opening_area_sq_m: float = 0.004 # ~10px at 0.02
+    min_furniture_area_sq_m: float = 0.15
     
     t_junction_split_tol_m: float = 0.2
     t_junction_end_margin_m: float = 0.2
@@ -1874,8 +1875,10 @@ def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        min_area_px = cfg.min_furniture_area_sq_m / (cfg.meters_per_pixel ** 2)
+        
         for i, cnt in enumerate(contours):
-            if cv2.contourArea(cnt) < 50: # Minimum area filter
+            if cv2.contourArea(cnt) < min_area_px: # Minimum area filter
                 continue
             
             # --- DECOMPOSITION ---
@@ -1921,6 +1924,19 @@ def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
                 
                 # Normalize rotation to [0, 180) or [0, 360)? 
                 final_rotation = final_rotation % 360
+                
+                # Orthogonal Snap: Snap to nearest 90 degrees if close
+                # Tolerance: 10 degrees?
+                snap_tol = 15.0
+                dist_to_0 = min(abs(final_rotation - 0), abs(final_rotation - 360))
+                dist_to_90 = abs(final_rotation - 90)
+                dist_to_180 = abs(final_rotation - 180)
+                dist_to_270 = abs(final_rotation - 270)
+                
+                if dist_to_0 < snap_tol: final_rotation = 0.0
+                elif dist_to_90 < snap_tol: final_rotation = 90.0
+                elif dist_to_180 < snap_tol: final_rotation = 180.0
+                elif dist_to_270 < snap_tol: final_rotation = 270.0
                 
                 # ID scheme: type_idx_subidx
                 f_id = f"{f_type}_{i}"
@@ -2121,6 +2137,12 @@ def main():
         default=None,
         help="Path to JSON file with real dimensions ('real-x', 'real-y'). Overrides --scale.",
     )
+    parser.add_argument(
+        "--min-furniture-area",
+        type=float,
+        default=0.04,
+        help="Minimum area (sq meters) for a furniture item to be included.",
+    )
     args = parser.parse_args()
     
     # Scale resolution
@@ -2195,6 +2217,8 @@ def main():
             raise e
 
     cfg = Config(meters_per_pixel=scale)
+    if args.min_furniture_area is not None:
+        cfg.min_furniture_area_sq_m = args.min_furniture_area
     
     # If we didn't run load_and_preprocess yet (no real_json), run it now.
     # If we DID run it, we already have the masks.
@@ -2313,6 +2337,42 @@ def main():
             lx = int(round(p1[0] + 0.2 * (p2[0] - p1[0])))
             ly = int(round(p1[1] + 0.2 * (p2[1] - p1[1])))
             cv2.putText(orig, w.id, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+        # Draw Furniture
+        for f in furniture:
+            # f coordinates are in meters, Y-up.
+            # to_px handles the Y-flip.
+            center_px = to_px((f.x, f.y))
+            size_px = (f.width / cfg.meters_per_pixel, f.length / cfg.meters_per_pixel)
+            
+            # Create rotated rect box
+            # OpenCV expects ((x,y), (w,h), angle)
+            # We stored 'width' as the dimension along the 'rotation' angle?
+            # In detect_furniture:
+            # width_m = max(w, h), length_m = min(w, h)
+            # final_rotation = angle (if w>h) else angle+90
+            # So 'width' is the long side, 'length' is the short side.
+            # And 'rotation' is the angle of the 'width' side?
+            # 
+            # If we pass ((cx, cy), (width_px, length_px), rotation) to boxPoints, 
+            # it should reconstruct the box correctly.
+            
+            rect = ((float(center_px[0]), float(center_px[1])), 
+                    (float(size_px[0]), float(size_px[1])), 
+                    float(f.rotation))
+            
+            box = cv2.boxPoints(rect)
+            box = np.int32(box) # np.int0 is deprecated/removed in newer numpy
+            
+            # Color based on type?
+            color = (0, 255, 255) # Yellow default
+            if f.type == "bed": color = (0, 0, 255) # Red
+            elif f.type == "table": color = (0, 255, 0) # Green
+            elif f.type == "chair": color = (255, 255, 0) # Cyan (BGR: Yellow is 0,255,255. Cyan is 255,255,0 BGR?? No, BGR. Cyan=Blue+Green=(255,255,0). Wait. BGR: B=255, G=255, R=0 -> Cyan)
+            elif f.type == "cabinet": color = (255, 0, 255) # Magenta/Purple
+            
+            cv2.drawContours(orig, [box], 0, color, 2)
+            cv2.putText(orig, f.id, box[0], cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
         for o in openings:
             if o.px_center is None:
