@@ -353,6 +353,16 @@ class Opening:
     sill: float = 0.0
     px_center: Optional[Tuple[int, int]] = None
 
+@dataclass
+class Furniture:
+    id: str
+    type: str
+    x: float
+    y: float
+    width: float
+    length: float
+    rotation: float
+
 # --- PHASE 0: IO & MASKS ---
 def get_opening_jamb_context(cnt, mask_wall, cfg: Config):
     """
@@ -750,7 +760,7 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
         cv2.imwrite(f"{debug_dir}/00_dist_map.png", (dist_map/dist_map.max()*255).astype(np.uint8))
         cv2.imwrite(f"{debug_dir}/00_openings_mask.png", mask_open)
 
-    return mask_union, mask_wall, mask_open, dist_map, img_rgb.shape[:2]
+    return mask_union, mask_wall, mask_open, dist_map, img_rgb.shape[:2], img_rgb
 
 # --- PHASE 1: SKELETON ---
 def build_skeleton_graph(mask_union, debug_dir, cfg):
@@ -1710,12 +1720,89 @@ def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
             )
     return "\n".join(lines)
 
-def emit_json(walls: List[Wall], openings: List[Opening], canvas_dims: Tuple[float, float]) -> str:
+def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
+    import numpy as np
+    import cv2
+    
+    # Use HSV for more robust color segmentation (matches api/furniture.py)
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    
+    # Color definitions (HSV ranges) - mapped to mask_prompt.md colors
+    # Bed: RED, Cabinet: PURPLE, Sofa: CYAN, Table: GREEN
+    colors = {
+        "bed": [
+            (np.array([0, 50, 50]), np.array([10, 255, 255])),   # Red (lower)
+            (np.array([170, 50, 50]), np.array([180, 255, 255])) # Red (upper)
+        ],
+        "table": [
+            (np.array([40, 50, 50]), np.array([80, 255, 255]))  # Green
+        ],
+        "chair": [
+            (np.array([85, 50, 50]), np.array([95, 255, 255]))  # Cyan
+        ],
+        "cabinet": [
+            (np.array([140, 50, 50]), np.array([160, 255, 255])) # Purple
+        ]
+    }
+    
+    furniture_items = []
+    h_px, w_px = img_rgb.shape[:2]
+    
+    for f_type, ranges in colors.items():
+        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for lower, upper in ranges:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lower, upper))
+        
+        # Morphological operations to clean up mask
+        kernel = np.ones((3,3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for i, cnt in enumerate(contours):
+            if cv2.contourArea(cnt) < 50: # Minimum area filter
+                continue
+            
+            rect = cv2.minAreaRect(cnt)
+            (center_px_x, center_px_y), (w, h), angle = rect
+            
+            # Convert to world meters
+            x_m = center_px_x * cfg.meters_per_pixel
+            y_m = (h_px - center_px_y) * cfg.meters_per_pixel # Flip Y for world coords
+            
+            # User example: width is longer side, length is shorter side
+            width_m = max(w, h) * cfg.meters_per_pixel
+            length_m = min(w, h) * cfg.meters_per_pixel
+            
+            # Adjust rotation to match "width" as longest side
+            final_rotation = angle
+            if w < h:
+                 final_rotation = angle + 90
+            
+            # Normalize rotation to [0, 180) or [0, 360)? 
+            # Furniture usually has a 180 symmetry for bbox, but let's keep it consistent.
+            final_rotation = final_rotation % 360
+            
+            furniture_items.append(Furniture(
+                id=f"{f_type}_{i}",
+                type=f_type,
+                x=round(x_m, 3),
+                y=round(y_m, 3),
+                width=round(width_m, 3),
+                length=round(length_m, 3),
+                rotation=round(final_rotation, 2)
+            ))
+            
+    return furniture_items
+
+def emit_json(walls: List[Wall], openings: List[Opening], furniture: List[Furniture], canvas_dims: Tuple[float, float]) -> str:
     import json
     
     # Sort for deterministic output
     walls.sort(key=lambda x: x.id)
     openings.sort(key=lambda x: (x.wall_id, x.at))
+    furniture.sort(key=lambda x: x.id)
     
     # Group openings by wall_id
     openings_by_wall = defaultdict(list)
@@ -1744,12 +1831,24 @@ def emit_json(walls: List[Wall], openings: List[Opening], canvas_dims: Tuple[flo
             "openings": w_openings
         })
         
+    furniture_output = []
+    for f in furniture:
+        furniture_output.append({
+            "type": f.type,
+            "x": f.x,
+            "y": f.y,
+            "width": f.width,
+            "length": f.length,
+            "rotation": f.rotation
+        })
+        
     output = {
         "canvas": {
             "width": round(canvas_dims[0], 3),
             "height": round(canvas_dims[1], 3)
         },
-        "walls": walls_output
+        "walls": walls_output,
+        "furniture": furniture_output
     }
     return json.dumps(output, indent=2)
 
@@ -1920,7 +2019,7 @@ def main():
             if args.debug_dir:
                 os.makedirs(args.debug_dir, exist_ok=True)
                 
-            mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg_initial)
+            mask_union, mask_wall, mask_open, dist_map, dims, img_rgb = load_and_preprocess(args.input, args.debug_dir, cfg_initial)
             
             h, w = dims
             # wall_bbox_px is needed for derive_isotropic_meters_per_pixel.
@@ -1958,7 +2057,7 @@ def main():
     if not args.real_json:
         if args.debug_dir:
             os.makedirs(args.debug_dir, exist_ok=True)
-        mask_union, mask_wall, mask_open, dist_map, dims = load_and_preprocess(args.input, args.debug_dir, cfg)
+        mask_union, mask_wall, mask_open, dist_map, dims, img_rgb = load_and_preprocess(args.input, args.debug_dir, cfg)
 
     # Rest of the pipeline matches main...
     
@@ -1983,12 +2082,17 @@ def main():
     # 3. Openings (Map to merged)
     openings = extract_openings(mask_open, mask_wall, walls_merged, cfg)
     
+    # 4. Furniture (If JSON requested)
+    furniture = []
+    if args.format == "json":
+        furniture = detect_furniture(img_rgb, cfg)
+    
     with open(args.out, "w") as f:
         if args.format == "json":
             h_px, w_px = dims
             canvas_width_m = w_px * scale
             canvas_height_m = h_px * scale
-            f.write(emit_json(walls_merged, openings, (canvas_width_m, canvas_height_m)))
+            f.write(emit_json(walls_merged, openings, furniture, (canvas_width_m, canvas_height_m)))
         else:
             f.write(emit_dsl(walls_merged, openings, cfg))
     print(f"Done! Written to {args.out}")
