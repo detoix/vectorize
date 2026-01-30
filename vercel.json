@@ -2,7 +2,9 @@
   "functions": {
     "api/vectorize.py": {
       "maxDuration": 60
+    },
+    "api/furniture.py": {
+      "maxDuration": 60
     }
   }
 }
-
