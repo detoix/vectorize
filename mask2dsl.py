@@ -1720,6 +1720,120 @@ def emit_dsl(walls: List[Wall], openings: List[Opening], cfg: Config):
             )
     return "\n".join(lines)
 
+
+# --- PHASE 7b: FURNITURE DECOMPOSITION ---
+
+def get_rotated_bbox_area(cnt):
+    rect = cv2.minAreaRect(cnt)
+    (x, y), (w, h), angle = rect
+    return w * h, rect
+
+def split_blob_recursive(mask_roi, pts_roi, roi_offset, min_solidity=0.75, depth=0, max_depth=2):
+    """
+    Recursively splits a contour point set if its solidity (Area/BBoxArea) is too low.
+    Uses a sweep-line approach to find a split that minimizes the sum of child bounding boxes.
+    
+    mask_roi: The binary mask of the ROI (for fast lookup, optional or used for exact cuts)
+    pts_roi: specific points of the contour in ROI coordinates
+    roi_offset: (x, y) of the ROI in the original image (to return global coords)
+    """
+    if len(pts_roi) < 3:
+        return []
+
+    # Compute Solidity
+    bbox_area, rect = get_rotated_bbox_area(pts_roi)
+    
+    # Estimate actual contour area (approx) or use minAreaRect as baseline
+    cnt_area = cv2.contourArea(pts_roi)
+    
+    if bbox_area < 1e-3: 
+        return [pts_roi + roi_offset] # Point or line
+
+    if bbox_area < 1e-3: 
+        return [pts_roi + roi_offset] # Point or line
+
+    ratio = cnt_area / bbox_area
+    
+    # Base case: Solid enough or too deep
+    if ratio >= min_solidity or depth >= max_depth:
+        # Return as global coordinates
+        return [pts_roi + roi_offset]
+
+
+
+    # --- Attempt Split ---
+    # We sweep X and Y in the ROI to find a cut that minimizes (AreaA + AreaB)
+    
+    x_min, y_min = pts_roi.min(axis=0)[0]
+    x_max, y_max = pts_roi.max(axis=0)[0]
+    w = x_max - x_min
+    h = y_max - y_min
+    
+    best_score = float('inf')
+    best_split = None # ('x'|'y', local_coord, pts_a, pts_b)
+    
+    step_x = max(1, int(w / 10))
+    step_y = max(1, int(h / 10))
+    
+    # Optimization: Only split if we have enough range
+    if w > 5:
+        for i in range(x_min + step_x, x_max, step_x):
+            mask_left = pts_roi[:, 0, 0] < i
+            pts_l = pts_roi[mask_left]
+            pts_r = pts_roi[~mask_left]
+            
+            if len(pts_l) < 3 or len(pts_r) < 3: continue
+            
+            # Fast bbox approximation
+            area_l = get_rotated_bbox_area(pts_l)[0]
+            area_r = get_rotated_bbox_area(pts_r)[0]
+            
+            if (area_l + area_r) < best_score:
+                best_score = area_l + area_r
+                best_split = ('x', i, pts_l, pts_r)
+
+    if h > 5:
+        for i in range(y_min + step_y, y_max, step_y):
+            mask_top = pts_roi[:, 0, 1] < i
+            pts_t = pts_roi[mask_top]
+            pts_b = pts_roi[~mask_top]
+            
+            if len(pts_t) < 3 or len(pts_b) < 3: continue
+            
+            area_t = get_rotated_bbox_area(pts_t)[0]
+            area_b = get_rotated_bbox_area(pts_b)[0]
+            
+            if (area_t + area_b) < best_score:
+                best_score = area_t + area_b
+                best_split = ('y', i, pts_t, pts_b)
+
+    # Threshold: Split must improve area efficiency
+    # If best split is worse than current bbox (unlikely) or marginal improvement?
+    # Actually, we rely on the solidity check of children to stop recursion.
+    # But if the split doesn't strictly reduce the bbox sum significantly compared to parent, maybe don't?
+    # Simple check: (AreaL + AreaR) < 0.9 * AreaParent?
+    
+    if best_split and best_score < bbox_area * 0.95:
+        # Recurse
+        # Note: We are splitting the POINT CLOUD. Bounding Box of point cloud is convex hull.
+        # We lose concavity info inside the sub-regions, but for furniture BBox fitting that's fine.
+        pts_a = best_split[2]
+        pts_b = best_split[3]
+        
+        # To call recursively, we need to treat them as contours. 
+        # convexHull is a good approximation for the 'contour' of the point cloud
+        hull_a = cv2.convexHull(pts_a)
+        hull_b = cv2.convexHull(pts_b)
+        
+        res = []
+        res.extend(split_blob_recursive(mask_roi, hull_a, roi_offset, min_solidity, depth+1, max_depth))
+        res.extend(split_blob_recursive(mask_roi, hull_b, roi_offset, min_solidity, depth+1, max_depth))
+        return res
+
+    # Failed to find good split
+    return [pts_roi + roi_offset]
+
+
 def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
     import numpy as np
     import cv2
@@ -1764,35 +1878,64 @@ def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
             if cv2.contourArea(cnt) < 50: # Minimum area filter
                 continue
             
-            rect = cv2.minAreaRect(cnt)
-            (center_px_x, center_px_y), (w, h), angle = rect
+            # --- DECOMPOSITION ---
+            # Extract ROI for this contour to speed up processing
+            x, y, w, h = cv2.boundingRect(cnt)
+            # Make point set relative to the bounding box (but we pass offset)
+            # Actually our recursive function handles ROI well if we pass points?
+            # Let's just pass points.
             
-            # Convert to world meters
-            x_m = center_px_x * cfg.meters_per_pixel
-            y_m = (h_px - center_px_y) * cfg.meters_per_pixel # Flip Y for world coords
+            # The contour points are already global (N, 1, 2).
+            # But recursive split does coordinate scanning. 
+            # It's cleaner to shift to 0,0 for numerical stability / smaller loops if we used mask scanning.
+            # But we use point scanning. So global coords are fine, BUT
+            # split_blob_recursive implementation above used ``pts_roi`` and ``roi_offset``.
+            # Let's map to local ROI 0,0
             
-            # User example: width is longer side, length is shorter side
-            width_m = max(w, h) * cfg.meters_per_pixel
-            length_m = min(w, h) * cfg.meters_per_pixel
+            pts_local = cnt - np.array([[[x, y]]], dtype=np.int32)
+            roi_offset = np.array([[[x, y]]], dtype=np.int32)
             
-            # Adjust rotation to match "width" as longest side
-            final_rotation = angle
-            if w < h:
-                 final_rotation = angle + 90
+            # Heuristic: Only decompose 'shelf-like' or 'complex' items? 
+            # Cabinets (L-shaped) need it. Tables/Beds usually convex.
+            # But "Bed + Nightstand" might be one blob.
+            # Let's apply to all, relying on solidity check.
             
-            # Normalize rotation to [0, 180) or [0, 360)? 
-            # Furniture usually has a 180 symmetry for bbox, but let's keep it consistent.
-            final_rotation = final_rotation % 360
+            sub_contours = split_blob_recursive(None, pts_local, roi_offset, min_solidity=0.75, depth=0, max_depth=2)
             
-            furniture_items.append(Furniture(
-                id=f"{f_type}_{i}",
-                type=f_type,
-                x=round(x_m, 3),
-                y=round(y_m, 3),
-                width=round(width_m, 3),
-                length=round(length_m, 3),
-                rotation=round(final_rotation, 2)
-            ))
+            for sub_i, sub_cnt in enumerate(sub_contours):
+                rect = cv2.minAreaRect(sub_cnt)
+                (center_px_x, center_px_y), (w, h), angle = rect
+                
+                # Convert to world meters
+                x_m = center_px_x * cfg.meters_per_pixel
+                y_m = (h_px - center_px_y) * cfg.meters_per_pixel # Flip Y for world coords
+                
+                # User example: width is longer side, length is shorter side
+                width_m = max(w, h) * cfg.meters_per_pixel
+                length_m = min(w, h) * cfg.meters_per_pixel
+                
+                # Adjust rotation to match "width" as longest side
+                final_rotation = angle
+                if w < h:
+                     final_rotation = angle + 90
+                
+                # Normalize rotation to [0, 180) or [0, 360)? 
+                final_rotation = final_rotation % 360
+                
+                # ID scheme: type_idx_subidx
+                f_id = f"{f_type}_{i}"
+                if len(sub_contours) > 1:
+                    f_id += f"_{sub_i}"
+                
+                furniture_items.append(Furniture(
+                    id=f_id,
+                    type=f_type,
+                    x=round(x_m, 3),
+                    y=round(y_m, 3),
+                    width=round(width_m, 3),
+                    length=round(length_m, 3),
+                    rotation=round(final_rotation, 2)
+                ))
             
     return furniture_items
 
@@ -1834,6 +1977,7 @@ def emit_json(walls: List[Wall], openings: List[Opening], furniture: List[Furnit
     furniture_output = []
     for f in furniture:
         furniture_output.append({
+            "id": f.id,
             "type": f.type,
             "x": f.x,
             "y": f.y,
