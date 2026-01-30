@@ -65,17 +65,17 @@ class handler(BaseHTTPRequestHandler):
         # Color definitions (HSV ranges)
         colors = {
             "table": [
-                (np.array([40, 50, 50]), np.array([80, 255, 255]))  # Green
+                (np.array([35, 50, 50]), np.array([80, 255, 255]))  # Green (Broad)
             ],
             "chair": [
-                (np.array([100, 50, 50]), np.array([140, 255, 255])) # Blue
+                (np.array([80, 50, 50]), np.array([100, 255, 255])) # Cyan (Broad)
             ],
             "bed": [
-                (np.array([0, 50, 50]), np.array([10, 255, 255])),   # Red (lower)
-                (np.array([170, 50, 50]), np.array([180, 255, 255])) # Red (upper)
+                (np.array([0, 50, 50]), np.array([15, 255, 255])),   # Red (lower)
+                (np.array([165, 50, 50]), np.array([180, 255, 255])) # Red (upper)
             ],
             "cabinet": [
-                (np.array([130, 50, 50]), np.array([160, 255, 255])) # Purple
+                (np.array([140, 50, 50]), np.array([170, 255, 255])) # Purple (Broad)
             ]
         }
         

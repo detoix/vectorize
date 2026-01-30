@@ -8,7 +8,8 @@ import numpy as np
 
 
 def wall_mask_from_image_rgb(img_rgb: np.ndarray) -> np.ndarray:
-    return cv2.inRange(img_rgb, np.array([250, 250, 250]), np.array([255, 255, 255]))
+    # Walls are now BLACKish. Loosened range to handle non-exact black.
+    return cv2.inRange(img_rgb, np.array([0, 0, 0]), np.array([80, 80, 80]))
 
 
 def wall_bbox_from_mask(mask_wall: np.ndarray) -> Tuple[int, int, int, int]:

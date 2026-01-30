@@ -715,10 +715,11 @@ def load_and_preprocess(path: str, debug_dir: str, cfg: Config):
     if img is None: raise FileNotFoundError(f"Could not load {path}")
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     
-    mask_wall = cv2.inRange(img_rgb, np.array([250, 250, 250]), np.array([255, 255, 255]))
-    # Robust opening threshold: use HSV so anti-aliased/compressed "blue" stays connected.
+    # Walls are now BLACKish. Background is WHITE.
+    mask_wall = cv2.inRange(img_rgb, np.array([0, 0, 0]), np.array([80, 80, 80]))
+    # Robust opening threshold: loosened HSV range to handle variance.
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower = np.array([90, 30, 50], dtype=np.uint8)
+    lower = np.array([100, 30, 50], dtype=np.uint8)
     upper = np.array([140, 255, 255], dtype=np.uint8)
     mask_open_raw = cv2.inRange(hsv, lower, upper)
     # Fill tiny gaps inside swings caused by threshold holes.

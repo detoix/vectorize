@@ -506,6 +506,104 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "Could not decode image bytes"})
             return
 
+        dims_payload: Optional[Dict[str, Any]] = None
+        dims_field = form["dims"] if "dims" in form else None
+        if isinstance(dims_field, list):
+            dims_field = dims_field[0] if dims_field else None
+
+        if dims_field is not None and getattr(dims_field, "filename", None):
+            try:
+                dims_payload = json.loads(dims_field.file.read().decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"ok": False, "error": "Invalid JSON in uploaded 'dims' file"})
+                return
+        else:
+            dims_text = None
+            if dims_field is not None and hasattr(dims_field, "value"):
+                dims_text = dims_field.value
+            if not dims_text:
+                dims_text = form.getfirst("dims") or form.getfirst("realDims") or form.getfirst("real_dims")
+            if dims_text:
+                try:
+                    dims_payload = json.loads(dims_text)
+                except Exception:
+                    self._send_json(400, {"ok": False, "error": "Invalid JSON in 'dims' field"})
+                    return
+
+        # Try to get discrete params if dims payload is missing
+        if not dims_payload:
+            real_x = form.getfirst("real-x") or form.getfirst("realX")
+            real_y = form.getfirst("real-y") or form.getfirst("realY")
+            
+            # If we have at least one dimension
+            if real_x or real_y:
+                dims_payload = {}
+                if real_x:
+                    unit = form.getfirst("real-x-unit") or form.getfirst("realXUnit") or "m"
+                    try:
+                        val = float(real_x)
+                        dims_payload["real-x"] = {"value": val, "unit": unit}
+                    except ValueError:
+                         self._send_json(400, {"ok": False, "error": f"Invalid number for real-x: {real_x}"})
+                         return
+
+                if real_y:
+                    unit = form.getfirst("real-y-unit") or form.getfirst("realYUnit") or "m"
+                    try:
+                        val = float(real_y)
+                        dims_payload["real-y"] = {"value": val, "unit": unit}
+                    except ValueError:
+                         self._send_json(400, {"ok": False, "error": f"Invalid number for real-y: {real_y}"})
+                         return
+
+        meters_per_pixel = 1.0
+        using_real_units = False
+
+        # Attempt to determine scale if dims are provided
+        if dims_payload:
+            try:
+                real_width_m, real_height_m = load_real_dims_from_payload(dims_payload)
+                
+                # We need to compute meters_per_pixel. 
+                # This usually expects walls to be present to determine the bbox.
+                # If this image is just furniture blobs, this might fail or be inaccurate 
+                # if we rely on wall detection.
+                # However, for now, we will try to detect walls (white pixels) 
+                # OR fallback to image dimensions if no walls found?
+                # Actually, derive_isotropic_meters_per_pixel uses wall_bbox_px.
+                
+                # Let's try to detect walls first, consistent with mask2dsl.
+                # Note: This assumes the furniture image HAS wall pixels (white/gray).
+                # If it's a transparency layer or black background, this will fail.
+                # But typically the input to this pipeline is the masked floorplan.
+                
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                mask_wall = wall_mask_from_image_rgb(img_rgb)
+                try:
+                    wall_bbox_px = wall_bbox_from_mask(mask_wall)
+                    mpp, _, _, _, _ = derive_isotropic_meters_per_pixel(
+                        wall_bbox_px=wall_bbox_px,
+                        real_width_m=real_width_m,
+                        real_height_m=real_height_m,
+                    )
+                    meters_per_pixel = mpp
+                    using_real_units = True
+                except ValueError:
+                    # Fallback: if no walls found, assume dims apply to the entire image 
+                    # (less likely but safer fallback than crashing)
+                    h, w = img_bgr.shape[:2]
+                    # We can't really do isotropic easily without a target bbox, 
+                    # so let's just use width if available, else height
+                    if real_width_m:
+                        meters_per_pixel = real_width_m / w
+                        using_real_units = True
+                    elif real_height_m:
+                        meters_per_pixel = real_height_m / h
+                        using_real_units = True
+            except ValueError as e:
+                 self._send_json(400, {"ok": False, "error": str(e)})
+                 return
+
         # Furniture processing logic
         furniture_items = []
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -513,17 +611,17 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
         # Color definitions (HSV ranges)
         colors = {
             "table": [
-                (np.array([40, 50, 50]), np.array([80, 255, 255]))  # Green
+                (np.array([35, 50, 50]), np.array([80, 255, 255]))  # Green (Broad)
             ],
             "chair": [
-                (np.array([100, 50, 50]), np.array([140, 255, 255])) # Blue
+                (np.array([80, 50, 50]), np.array([100, 255, 255])) # Cyan (Broad)
             ],
             "bed": [
-                (np.array([0, 50, 50]), np.array([10, 255, 255])),   # Red (lower)
-                (np.array([170, 50, 50]), np.array([180, 255, 255])) # Red (upper)
+                (np.array([0, 50, 50]), np.array([15, 255, 255])),   # Red (lower)
+                (np.array([165, 50, 50]), np.array([180, 255, 255])) # Red (upper)
             ],
             "cabinet": [
-                (np.array([130, 50, 50]), np.array([160, 255, 255])) # Purple
+                (np.array([140, 50, 50]), np.array([170, 255, 255])) # Purple (Broad)
             ]
         }
         
@@ -539,7 +637,7 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for cnt in contours:
-                if cv2.contourArea(cnt) < 50: # Minimum area filter
+                if cv2.contourArea(cnt) < 50: # Minimum area filter (pixels)
                     continue
                 
                 rect = cv2.minAreaRect(cnt)
@@ -556,14 +654,18 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
                 
                 furniture_items.append({
                     "type": f_type,
-                    "x": center_x,
-                    "y": center_y,
-                    "length": length,
-                    "width": width,
+                    "x": center_x * meters_per_pixel,
+                    "y": center_y * meters_per_pixel,
+                    "length": length * meters_per_pixel,
+                    "width": width * meters_per_pixel,
                     "rotation": final_rotation
                 })
 
-        self._send_json(200, {"furniture": furniture_items})
+        self._send_json(200, {
+            "furniture": furniture_items,
+            "meters_per_pixel": meters_per_pixel if using_real_units else None,
+            "units": "meters" if using_real_units else "pixels"
+        })
 
 
 def main(argv: Optional[list] = None) -> int:
