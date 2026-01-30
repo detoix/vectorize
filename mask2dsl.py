@@ -282,6 +282,10 @@ class Config:
     default_thickness: float = 0.20 # Used if sampling fails
     
     # Tolerances & Thresholds (Meters)
+    decomp_solidity_threshold: float = 0.85
+    decomp_scan_step_m: float = 0.1
+    decomp_improvement_threshold: float = 0.8
+    
     gravity_snap_axis_snap_tol_m: float = 0.20
     consolidate_axis_cluster_tol_m: float = 0.15
     collinear_tol_deg: float = 15.0 
@@ -318,8 +322,8 @@ class Config:
     # Extracted Hardcoded Values (Meters)
     corner_cut_min_len_m: float = 0.24
     corner_cut_max_len_m: float = 5.0
-    min_opening_area_sq_m: float = 0.004 # ~10px at 0.02
-    min_furniture_area_sq_m: float = 0.15
+    min_opening_area_sq_m: float = 0.004
+    min_furniture_area_sq_m: float = 0.10
     
     t_junction_split_tol_m: float = 0.2
     t_junction_end_margin_m: float = 0.2
@@ -1729,7 +1733,7 @@ def get_rotated_bbox_area(cnt):
     (x, y), (w, h), angle = rect
     return w * h, rect
 
-def split_blob_recursive(mask_roi, pts_roi, roi_offset, min_solidity=0.75, depth=0, max_depth=2):
+def split_blob_recursive(mask_roi, pts_roi, roi_offset, cfg, min_solidity=0.75, depth=0, max_depth=2):
     """
     Recursively splits a contour point set if its solidity (Area/BBoxArea) is too low.
     Uses a sweep-line approach to find a split that minimizes the sum of child bounding boxes.
@@ -1776,6 +1780,9 @@ def split_blob_recursive(mask_roi, pts_roi, roi_offset, min_solidity=0.75, depth
     step_x = max(1, int(w / 10))
     step_y = max(1, int(h / 10))
     
+    # Minimum dimension in meters (e.g. 10cm)
+    min_dim_px = 0.1 / cfg.meters_per_pixel
+    
     # Optimization: Only split if we have enough range
     if w > 5:
         for i in range(x_min + step_x, x_max, step_x):
@@ -1785,9 +1792,18 @@ def split_blob_recursive(mask_roi, pts_roi, roi_offset, min_solidity=0.75, depth
             
             if len(pts_l) < 3 or len(pts_r) < 3: continue
             
-            # Fast bbox approximation
-            area_l = get_rotated_bbox_area(pts_l)[0]
-            area_r = get_rotated_bbox_area(pts_r)[0]
+            # Check for slivers
+            rect_l = cv2.minAreaRect(pts_l)
+            rect_r = cv2.minAreaRect(pts_r)
+            
+            # Avoid splits that result in very thin strips (noise)
+            # minAreaRect returns ((x,y), (w,h), angle)
+            # rect[1] is (w, h)
+            if min(rect_l[1]) < min_dim_px or min(rect_r[1]) < min_dim_px:
+                continue
+
+            area_l = rect_l[1][0] * rect_l[1][1]
+            area_r = rect_r[1][0] * rect_r[1][1]
             
             if (area_l + area_r) < best_score:
                 best_score = area_l + area_r
@@ -1800,39 +1816,230 @@ def split_blob_recursive(mask_roi, pts_roi, roi_offset, min_solidity=0.75, depth
             pts_b = pts_roi[~mask_top]
             
             if len(pts_t) < 3 or len(pts_b) < 3: continue
+
+            # Check for slivers
+            rect_t = cv2.minAreaRect(pts_t)
+            rect_b = cv2.minAreaRect(pts_b)
             
-            area_t = get_rotated_bbox_area(pts_t)[0]
-            area_b = get_rotated_bbox_area(pts_b)[0]
+            if min(rect_t[1]) < min_dim_px or min(rect_b[1]) < min_dim_px:
+                continue
+            
+            area_t = rect_t[1][0] * rect_t[1][1]
+            area_b = rect_b[1][0] * rect_b[1][1]
             
             if (area_t + area_b) < best_score:
                 best_score = area_t + area_b
-                best_split = ('y', i, pts_t, pts_b)
-
-    # Threshold: Split must improve area efficiency
-    # If best split is worse than current bbox (unlikely) or marginal improvement?
-    # Actually, we rely on the solidity check of children to stop recursion.
-    # But if the split doesn't strictly reduce the bbox sum significantly compared to parent, maybe don't?
-    # Simple check: (AreaL + AreaR) < 0.9 * AreaParent?
+                best_split = ('y', i, pts_t, pts_b) 
     
     if best_split and best_score < bbox_area * 0.95:
-        # Recurse
-        # Note: We are splitting the POINT CLOUD. Bounding Box of point cloud is convex hull.
-        # We lose concavity info inside the sub-regions, but for furniture BBox fitting that's fine.
+        
         pts_a = best_split[2]
         pts_b = best_split[3]
         
-        # To call recursively, we need to treat them as contours. 
-        # convexHull is a good approximation for the 'contour' of the point cloud
-        hull_a = cv2.convexHull(pts_a)
-        hull_b = cv2.convexHull(pts_b)
-        
+        # Recurse on RAW points, not hull.
+        # This preserves the detail for the next split.
         res = []
-        res.extend(split_blob_recursive(mask_roi, hull_a, roi_offset, min_solidity, depth+1, max_depth))
-        res.extend(split_blob_recursive(mask_roi, hull_b, roi_offset, min_solidity, depth+1, max_depth))
+        res.extend(split_blob_recursive(mask_roi, pts_a, roi_offset, cfg, min_solidity, depth+1, max_depth))
+        res.extend(split_blob_recursive(mask_roi, pts_b, roi_offset, cfg, min_solidity, depth+1, max_depth))
         return res
 
     # Failed to find good split
     return [pts_roi + roi_offset]
+
+
+def decompose_mask_recursive(mask_roi, x_off, y_off, cfg, depth=0):
+    """
+    Recursively splits a binary mask using axis-aligned cuts to minimize BBox area.
+    Returns list of global (x, y, w, h) tuples.
+    """
+    # 1. Base BBox
+    # Find non-zero pixels
+    pts = cv2.findNonZero(mask_roi)
+    if pts is None: return []
+    
+    x, y, w, h = cv2.boundingRect(pts)
+    bbox_area = w * h
+    
+    # Solidity Check
+    area_pixels = cv2.countNonZero(mask_roi)
+    solidity = area_pixels / (bbox_area + 1e-5)
+    
+    min_dim_px = 0.1 / cfg.meters_per_pixel # 10cm
+    
+    # BASE CASES
+    if w < min_dim_px or h < min_dim_px:
+        # Too small to split further, return as is
+        return [(x + x_off, y + y_off, w, h)]
+        
+    if solidity > cfg.decomp_solidity_threshold or depth > 3:
+        # It's a solid rectangle (or deep enough), return valid bbox
+        return [(x + x_off, y + y_off, w, h)]
+        
+    # 2. Find Best Split
+    # Optimization: Scan every N meters (e.g. 10cm) or at least 1/10th of dimension
+    step_m_px = int(cfg.decomp_scan_step_m / cfg.meters_per_pixel)
+    step = max(1, step_m_px)
+    
+    best_score = float('inf')
+    best_split = None # ('x'|'y', local_coord_in_roi)
+    
+    # We only scan INSIDE the bounding box of the actual pixels
+    x_start, x_end = x, x + w
+    y_start, y_end = y, y + h
+    
+    # Better Strategy: Projection Profiles is complex to implement correctly
+    # Falling back to robust strided scan inside crop
+    crop = mask_roi[y:y+h, x:x+w]
+    h_c, w_c = crop.shape
+    # Helper to compute cost and blob count
+    def get_bbox_cost(m_part):
+        # findContours to handle disjoint parts
+        cnts, _ = cv2.findContours(m_part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        total_area = 0.0
+        n_blobs = 0
+        for c in cnts:
+            bx, by, bw, bh = cv2.boundingRect(c)
+            # Filter tiny noise from blob count to avoid penalizing valid splits with dust
+            c_area = bw * bh
+            if c_area > (min_dim_px * min_dim_px): # Only count significant blobs
+                total_area += c_area
+                n_blobs += 1
+            else:
+                 # Still add area for correctness, but maybe don't count as a "structure"
+                 total_area += c_area
+        return total_area, n_blobs
+
+    # Try X-splits
+    if w_c > min_dim_px * 2:
+        # Ensure we don't start too close to edge
+        margin = max(1, int(min_dim_px))
+        
+        for i in range(margin, w_c - margin, step):
+            m_l = crop[:, :i]
+            m_r = crop[:, i:]
+            
+            # Fast check
+            if cv2.countNonZero(m_l) == 0 or cv2.countNonZero(m_r) == 0: continue
+            
+            cost_l, blobs_l = get_bbox_cost(m_l)
+            cost_r, blobs_r = get_bbox_cost(m_r)
+            
+            area_sum = cost_l + cost_r
+            total_blobs = blobs_l + blobs_r
+            
+            # PENALTY: 5% extra cost per extra blob
+            # This favors splits that result in fewer, larger pieces (Natural cuts)
+            # over splits that shatter pieces (Artificial cuts)
+            score = area_sum * (1.0 + 0.05 * max(0, total_blobs - 1))
+            
+            if score < best_score:
+                best_score = score
+                best_split = ('x', x + i) # global to mask_roi
+
+    # Try Y-splits (Horizontal cut)
+    if h_c > min_dim_px * 2:
+        margin = max(1, int(min_dim_px))
+        
+        for i in range(margin, h_c - margin, step):
+            m_t = crop[:i, :]
+            m_b = crop[i:, :]
+            
+            if cv2.countNonZero(m_t) == 0 or cv2.countNonZero(m_b) == 0: continue
+            
+            cost_t, blobs_t = get_bbox_cost(m_t)
+            cost_b, blobs_b = get_bbox_cost(m_b)
+            
+            area_sum = cost_t + cost_b
+            total_blobs = blobs_t + blobs_b
+            
+            # PENALTY: Same as above
+            score = area_sum * (1.0 + 0.05 * max(0, total_blobs - 1))
+            
+            if score < best_score:
+                best_score = score
+                best_split = ('y', y + i)
+
+    # 3. Apply Split or Return
+    # If improvement is significant (e.g. < 90% of old area)
+    if best_split and best_score < (bbox_area * cfg.decomp_improvement_threshold):
+        axis, coord = best_split
+        
+        if axis == 'x':
+            # mask_roi is (H, W)
+            # coord is index in columns
+            mask1 = mask_roi.copy()
+            mask2 = mask_roi.copy()
+            
+            mask1[:, coord:] = 0
+            mask2[:, :coord] = 0
+            
+            # Recurse (offsets don't change for mask1, but internal origins might)
+            # Actually we pass the same offsets because mask1 is same size as mask_roi
+            res = []
+            res.extend(decompose_mask_recursive(mask1, x_off, y_off, cfg, depth+1))
+            res.extend(decompose_mask_recursive(mask2, x_off, y_off, cfg, depth+1))
+            return res
+            
+        else: # 'y'
+            mask1 = mask_roi.copy()
+            mask2 = mask_roi.copy()
+            
+            mask1[coord:, :] = 0
+            mask2[:coord, :] = 0
+            
+            res = []
+            res.extend(decompose_mask_recursive(mask1, x_off, y_off, cfg, depth+1))
+            res.extend(decompose_mask_recursive(mask2, x_off, y_off, cfg, depth+1))
+            return res
+            
+    # No good split found, return current valid bbox
+    return [(x + x_off, y + y_off, w, h)]
+
+
+def decompose_furniture_mask(binary_mask, cfg: Config):
+    """
+    Wrapper for Grid-Aligned Recursive Decomposition.
+    1. Clean Noise.
+    2. Extract loose separate blobs (Contours).
+    3. Recursively decompose each blob.
+    """
+    # 1. Cleanup
+    kernel_clean = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel_clean)
+    
+    # 2. Find Independent Blobs
+    contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    final_rects = []
+    
+    min_area_px = cfg.min_furniture_area_sq_m / (cfg.meters_per_pixel ** 2)
+    
+    for cnt in contours:
+        if cv2.contourArea(cnt) < min_area_px:
+            continue
+            
+        # Create ROI mask for this blob
+        x, y, w, h = cv2.boundingRect(cnt)
+        roi = np.zeros((h, w), dtype=np.uint8)
+        
+        # Draw this specific contour onto the ROI
+        pts_local = cnt - np.array([[[x, y]]], dtype=np.int32)
+        cv2.drawContours(roi, [pts_local], -1, 255, -1)
+        
+        # Recurse
+        rects = decompose_mask_recursive(roi, x, y, cfg, depth=0)
+        
+        # Collect
+        for (rx, ry, rw, rh) in rects:
+            if (rw * rh) < min_area_px: continue
+            
+            # Convert to center/size/angle format expected by caller
+            center = (rx + rw/2.0, ry + rh/2.0)
+            size = (rw, rh)
+            angle = 0.0 # Strict Axis Aligned
+            final_rects.append((center, size, angle))
+            
+    return final_rects
 
 
 def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
@@ -1873,85 +2080,62 @@ def detect_furniture(img_rgb: np.ndarray, cfg: Config) -> List[Furniture]:
         kernel = np.ones((3,3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 4. DECOMPOSE & DETECT
+        # Instead of finding raw contours, we use morphological decomposition
+        rects = decompose_furniture_mask(mask, cfg)
         
-        min_area_px = cfg.min_furniture_area_sq_m / (cfg.meters_per_pixel ** 2)
-        
-        for i, cnt in enumerate(contours):
-            if cv2.contourArea(cnt) < min_area_px: # Minimum area filter
-                continue
+        for (center_global, size_global, angle_deg) in rects:
+            # rects returns ( (x,y), (w,h), angle ) in mask coordinates (pixels)
+            # We need to convert to world meters (Y-up convention)
             
-            # --- DECOMPOSITION ---
-            # Extract ROI for this contour to speed up processing
-            x, y, w, h = cv2.boundingRect(cnt)
-            # Make point set relative to the bounding box (but we pass offset)
-            # Actually our recursive function handles ROI well if we pass points?
-            # Let's just pass points.
+            center_px_x, center_px_y = center_global
+            width_px, length_px = size_global
             
-            # The contour points are already global (N, 1, 2).
-            # But recursive split does coordinate scanning. 
-            # It's cleaner to shift to 0,0 for numerical stability / smaller loops if we used mask scanning.
-            # But we use point scanning. So global coords are fine, BUT
-            # split_blob_recursive implementation above used ``pts_roi`` and ``roi_offset``.
-            # Let's map to local ROI 0,0
+            x_m = center_px_x * cfg.meters_per_pixel
             
-            pts_local = cnt - np.array([[[x, y]]], dtype=np.int32)
-            roi_offset = np.array([[[x, y]]], dtype=np.int32)
+            # Floorplan image (0,0) is top-left. World (0,0) is bottom-left.
+            h_img = img_rgb.shape[0]
+            # y_m = (h_img - y_px) convention used in this script?
+            # Let's check previous usage. Yes: y_m = ... see lines above.
+            # But wait, lines above used: y_m = (h_px - center_px_y)... 
+            # 'h_px' variable was not defined in the loop I deleted? 
+            # Ah, it was used in `minAreaRect` context.
+            # We need image height.
+            y_m = (h_img - center_px_y) * cfg.meters_per_pixel
             
-            # Heuristic: Only decompose 'shelf-like' or 'complex' items? 
-            # Cabinets (L-shaped) need it. Tables/Beds usually convex.
-            # But "Bed + Nightstand" might be one blob.
-            # Let's apply to all, relying on solidity check.
+            width_m = width_px * cfg.meters_per_pixel
+            length_m = length_px * cfg.meters_per_pixel
             
-            sub_contours = split_blob_recursive(None, pts_local, roi_offset, min_solidity=0.75, depth=0, max_depth=2)
+            # Rotation
+            # We ensure width is the longer dimension
+            final_rotation = angle_deg
+            if width_m < length_m:
+                 width_m, length_m = length_m, width_m
+                 final_rotation += 90.0
             
-            for sub_i, sub_cnt in enumerate(sub_contours):
-                rect = cv2.minAreaRect(sub_cnt)
-                (center_px_x, center_px_y), (w, h), angle = rect
-                
-                # Convert to world meters
-                x_m = center_px_x * cfg.meters_per_pixel
-                y_m = (h_px - center_px_y) * cfg.meters_per_pixel # Flip Y for world coords
-                
-                # User example: width is longer side, length is shorter side
-                width_m = max(w, h) * cfg.meters_per_pixel
-                length_m = min(w, h) * cfg.meters_per_pixel
-                
-                # Adjust rotation to match "width" as longest side
-                final_rotation = angle
-                if w < h:
-                     final_rotation = angle + 90
-                
-                # Normalize rotation to [0, 180) or [0, 360)? 
-                final_rotation = final_rotation % 360
-                
-                # Orthogonal Snap: Snap to nearest 90 degrees if close
-                # Tolerance: 10 degrees?
-                snap_tol = 15.0
-                dist_to_0 = min(abs(final_rotation - 0), abs(final_rotation - 360))
-                dist_to_90 = abs(final_rotation - 90)
-                dist_to_180 = abs(final_rotation - 180)
-                dist_to_270 = abs(final_rotation - 270)
-                
-                if dist_to_0 < snap_tol: final_rotation = 0.0
-                elif dist_to_90 < snap_tol: final_rotation = 90.0
-                elif dist_to_180 < snap_tol: final_rotation = 180.0
-                elif dist_to_270 < snap_tol: final_rotation = 270.0
-                
-                # ID scheme: type_idx_subidx
-                f_id = f"{f_type}_{i}"
-                if len(sub_contours) > 1:
-                    f_id += f"_{sub_i}"
-                
-                furniture_items.append(Furniture(
-                    id=f_id,
-                    type=f_type,
-                    x=round(x_m, 3),
-                    y=round(y_m, 3),
-                    width=round(width_m, 3),
-                    length=round(length_m, 3),
-                    rotation=round(final_rotation, 2)
-                ))
+            # Snap rotation logic
+            rot = final_rotation % 360
+            snap_tol = cfg.ortho_tol_deg
+            
+            if abs(rot) < snap_tol: rot = 0
+            elif abs(rot - 90) < snap_tol: rot = 90
+            elif abs(rot - 180) < snap_tol: rot = 180
+            elif abs(rot - 270) < snap_tol: rot = 270
+            elif abs(rot - 360) < snap_tol: rot = 0
+            
+            # Unique ID
+            # Count existing items of this type
+            count = len([f for f in furniture_items if f.type == f_type])
+            
+            furniture_items.append(Furniture(
+                id=f"{f_type}_{count}",
+                type=f_type,
+                x=float(round(x_m, 3)),
+                y=float(round(y_m, 3)),
+                width=float(round(width_m, 3)),
+                length=float(round(length_m, 3)),
+                rotation=float(round(rot, 2))
+            ))
             
     return furniture_items
 
