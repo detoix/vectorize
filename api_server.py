@@ -19,6 +19,8 @@ from extract_scale import (
 
 import numpy as np
 import cv2
+import diff_utils
+
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
@@ -99,6 +101,13 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
                 self._handle_furniture_multipart(repo_root, content_type)
                 return
             self._send_json(400, {"ok": False, "error": "Only multipart/form-data is supported for /furniture"})
+            return
+
+        if path == "/api/diff":
+            if content_type.startswith("multipart/form-data"):
+                self._handle_diff_vectorize_multipart(repo_root, content_type)
+                return
+            self._send_json(400, {"ok": False, "error": "Only multipart/form-data is supported for /api/diff"})
             return
 
         self._send_json(404, {"ok": False, "error": "Not found"})
@@ -666,6 +675,118 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
             "meters_per_pixel": meters_per_pixel if using_real_units else None,
             "units": "meters" if using_real_units else "pixels"
         })
+
+    def _handle_diff_vectorize_multipart(self, repo_root: str, content_type: str) -> None:
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
+            )
+        except Exception as e:
+            self._send_json(400, {"ok": False, "error": f"Invalid multipart form: {e}"})
+            return
+
+        # 1. Get Images (Original, Target)
+        orig_field = form["original"] if "original" in form else None
+        target_field = form["target"] if "target" in form else None
+        
+        if not orig_field or not getattr(orig_field, "file", None):
+             self._send_json(400, {"ok": False, "error": "Missing 'original' image file"})
+             return
+        if not target_field or not getattr(target_field, "file", None):
+             self._send_json(400, {"ok": False, "error": "Missing 'target' image file"})
+             return
+
+        # 2. Setup Temp Dir
+        request_dir_root = os.path.join(repo_root, ".api_tmp")
+        os.makedirs(request_dir_root, exist_ok=True)
+        request_id = uuid.uuid4().hex
+        request_dir = os.path.join(request_dir_root, request_id)
+        os.makedirs(request_dir, exist_ok=True)
+
+        orig_path = os.path.join(request_dir, "original.png")
+        target_path = os.path.join(request_dir, "target.png")
+        
+        with open(orig_path, "wb") as f: f.write(orig_field.file.read())
+        with open(target_path, "wb") as f: f.write(target_field.file.read())
+
+        # 3. Load Images & Compute Diff Mask
+        orig_img = cv2.imread(orig_path)
+        target_img = cv2.imread(target_path)
+        
+        if orig_img is None or target_img is None:
+             self._send_json(400, {"ok": False, "error": "Failed to decode images"})
+             return
+
+        added_mask, removed_mask = diff_utils.compute_change_mask(orig_img, target_img)
+        cv2.imwrite(os.path.join(request_dir, "change_mask.png"), added_mask) # Save main one for debug
+        cv2.imwrite(os.path.join(request_dir, "removed_mask.png"), removed_mask)
+
+        # 4. Determine Scale (Meters Per Pixel)
+        # Try to use 'dims' JSON if provided, otherwise default or error?
+        # Similar logic to _handle_mask2dsl_multipart
+        dims_payload = None
+        dims_field = form["dims"] if "dims" in form else None
+        if dims_field and getattr(dims_field, "file", None): # File upload
+             dims_payload = json.loads(dims_field.file.read().decode("utf-8"))
+        elif form.getfirst("dims"): # Text field
+             dims_payload = json.loads(form.getfirst("dims"))
+        
+        meters_per_pixel = 0.02 # Default fallback
+        
+        if dims_payload:
+            try:
+                rw, rh = load_real_dims_from_payload(dims_payload)
+                # Compute mpp using Target Image walls
+                img_rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
+                mask_wall = wall_mask_from_image_rgb(img_rgb)
+                wall_bbox_px = wall_bbox_from_mask(mask_wall)
+                meters_per_pixel, _, _, _, _ = derive_isotropic_meters_per_pixel(
+                    wall_bbox_px, rw, rh
+                )
+            except Exception as e:
+                # If cannot determine, fallback or error?
+                pass
+        else:
+             # Legacy/Fallback scale param
+             s_val = form.getfirst("scale")
+             if s_val: meters_per_pixel = float(s_val)
+
+        # 5. Run Vectorization on TARGET
+        out_path = os.path.join(request_dir, "output.dsl")
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "mask2dsl.py"),
+            "--input",
+            target_path, # We vectorize the Target
+            "--scale",
+            str(meters_per_pixel),
+            "--out",
+            out_path,
+            "--format", "json", # Force JSON for parsing
+            "--debug-dir",
+            os.path.join(request_dir, "debug"),
+        ]
+        
+        completed = subprocess.run(cmd, capture_output=True, text=True, cwd=repo_root, check=False)
+        if completed.returncode != 0:
+             self._send_json(500, {"ok": False, "error": "Vectorization failed", "details": completed.stderr[:500]})
+             return
+             
+        # 6. Load DSL/JSON and Filter
+        with open(out_path, "r") as f:
+            full_dsl_json = json.load(f)
+            
+        filtered_dsl = diff_utils.filter_dsl(full_dsl_json, added_mask, removed_mask, meters_per_pixel)
+        
+        # 7. Return Result
+        self._send_json(200, {
+            "ok": True,
+            "result": filtered_dsl, # The filtered entities
+            "debug_id": request_id
+        })
+
 
 
 def main(argv: Optional[list] = None) -> int:

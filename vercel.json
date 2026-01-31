@@ -5,6 +5,9 @@
     },
     "api/furniture.py": {
       "maxDuration": 60
+    },
+    "api/diff.py": {
+      "maxDuration": 60
     }
   }
 }
