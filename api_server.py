@@ -661,10 +661,11 @@ class VectorizeAPIHandler(BaseHTTPRequestHandler):
                 if w < h:
                      final_rotation = angle + 90
                 
+                h_img = img_bgr.shape[0]
                 furniture_items.append({
                     "type": f_type,
                     "x": center_x * meters_per_pixel,
-                    "y": center_y * meters_per_pixel,
+                    "y": (h_img - center_y) * meters_per_pixel,
                     "length": length * meters_per_pixel,
                     "width": width * meters_per_pixel,
                     "rotation": final_rotation

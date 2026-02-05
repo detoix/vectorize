@@ -2191,6 +2191,7 @@ def emit_json(walls: List[Wall], openings: List[Opening], furniture: List[Furnit
             "width": round(canvas_dims[0], 3),
             "height": round(canvas_dims[1], 3)
         },
+        "units": "meters",
         "walls": walls_output,
         "furniture": furniture_output
     }

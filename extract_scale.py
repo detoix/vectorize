@@ -158,7 +158,16 @@ def derive_isotropic_meters_per_pixel(
         mpp_y = float(real_height_m) / float(px_h)
 
     if mpp_x is not None and mpp_y is not None:
+        ratio_real = real_width_m / real_height_m
+        ratio_px = px_w / px_h
+        diff_pct = abs(ratio_real - ratio_px) / ratio_real * 100.0
+        print(f"DEBUG SCALE: mpp_x={mpp_x:.6f}, mpp_y={mpp_y:.6f}")
+        print(f"DEBUG SCALE: Real Aspect Ratio={ratio_real:.3f}, Pixel Aspect Ratio={ratio_px:.3f} (Diff: {diff_pct:.1f}%)")
+        
+        # Isotropic: choose the scale that fits the largest dimension into the requested real size
+        # Or rather, choose the scale that ensures no dimension EXCEEDS requested real size
         mpp = min(mpp_x, mpp_y)
+        print(f"DEBUG SCALE: Isotropic mpp={mpp:.6f}")
     else:
         mpp = mpp_x if mpp_x is not None else mpp_y
 
