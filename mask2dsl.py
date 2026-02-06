@@ -312,6 +312,11 @@ class Config:
     default_window_height_m: float = 1.2
     default_window_sill_m: float = 0.9
     
+    # Door filtering and standardization
+    door_width_standardize_min_m: float = 0.5
+    door_width_standardize_max_m: float = 2.0
+    door_width_standard_m: float = 0.9
+    
     opening_wall_max_dist_m: float = 1.2
     opening_search_dilate_m: float = 0.30
     corner_gap_deviation_deg: float = 30.0
@@ -1670,6 +1675,17 @@ def extract_openings(mask_open, mask_wall, walls: List[Wall], cfg: Config):
             opening_type = "window"
             sill_m = cfg.default_window_sill_m
             height_m = cfg.default_window_height_m
+
+        # --- DOOR FILTERING & STANDARDIZATION ---
+        if opening_type == "door":
+            # Filter: If > max or < min, assume it's a mistake (noise or too small/large)
+            if width_m > cfg.door_width_standardize_max_m or width_m < cfg.door_width_standardize_min_m:
+                continue
+            
+            # Standardize: e.g. 0.6m - 1.0m -> 0.9m
+            if cfg.door_width_standardize_min_m <= width_m <= cfg.door_width_standardize_max_m:
+                width_m = cfg.door_width_standard_m
+        # ----------------------------------------
 
         # Project centroid to wall axis, then convert to "edge closest to wall.start".
         w_line = LineString([best_wall.start, best_wall.end])
